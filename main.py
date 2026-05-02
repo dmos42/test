@@ -1,5 +1,6 @@
 import sys
 import os
+import traceback
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -283,6 +284,31 @@ class MplCanvas(FigureCanvas):
         self.setParent(parent)
 
 
+class SafeNavigationToolbar(NavigationToolbar):
+    def save_figure(self, *args, **kwargs):
+        try:
+            file_filters = (
+                "PNG Image (*.png);;"
+                "PDF Document (*.pdf);;"
+                "SVG Image (*.svg);;"
+                "JPEG Image (*.jpg *.jpeg)"
+            )
+            
+            filepath, _ = QFileDialog.getSaveFileName(
+                self,
+                "Enregistrer le graphique",
+                "graphique.png",
+                file_filters
+            )
+            
+            if filepath:
+                self.canvas.figure.savefig(filepath)
+                QMessageBox.information(self, "Succès", f"Graphique enregistré :\n{filepath}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Impossible de sauvegarder le graphique :\n{e}")
+
+
 class StatisticalApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -495,7 +521,7 @@ class StatisticalApp(QMainWindow):
 
         canvas = MplCanvas(right, width=7, height=8)
         right_layout.addWidget(canvas)
-        toolbar = NavigationToolbar(canvas, right)
+        toolbar = SafeNavigationToolbar(canvas, right)
         right_layout.addWidget(toolbar)
 
         layout.addWidget(left)
@@ -540,7 +566,8 @@ class StatisticalApp(QMainWindow):
         params_layout.addRow("Taille sous-groupe :", self.cap_subgroup)
 
         self.cap_method = QComboBox()
-        self.cap_method.addItems(["rbar", "sbar", "pooled"])
+        self.cap_method.addItems(["pooled", "rbar", "sbar"])
+        self.cap_method.setCurrentText("pooled")
         params_layout.addRow("Méthode estimation σ :", self.cap_method)
 
         self.cap_confidence = QDoubleSpinBox()
@@ -666,7 +693,10 @@ class StatisticalApp(QMainWindow):
         ax3.set_title("QQ Plot")
         ax3.grid(True, alpha=0.3)
 
-        self.cap_canvas.fig.tight_layout()
+        try:
+            self.cap_canvas.fig.tight_layout()
+        except Exception:
+            pass
         self.cap_canvas.draw()
 
     def _get_raw_data_for_plot(self):
@@ -803,7 +833,10 @@ class StatisticalApp(QMainWindow):
         ax4.legend(fontsize=8)
         ax4.set_title("Densité KDE vs Normale")
 
-        self.norm_canvas.fig.tight_layout()
+        try:
+            self.norm_canvas.fig.tight_layout()
+        except Exception:
+            pass
         self.norm_canvas.draw()
 
     def _create_outliers_tab(self):
@@ -949,7 +982,10 @@ class StatisticalApp(QMainWindow):
         ax3.set_xlabel("Index")
         ax3.set_ylabel("Écart absolu")
 
-        self.out_canvas.fig.tight_layout()
+        try:
+            self.out_canvas.fig.tight_layout()
+        except Exception:
+            pass
         self.out_canvas.draw()
 
     def _export_results(self):
