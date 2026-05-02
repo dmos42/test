@@ -201,21 +201,28 @@ class CapabilityAnalysis:
 
         if "cpk" in self._results:
             cpk = self._results["cpk"]
-            se_cpk = np.sqrt(cpk**2 / (2 * (n - 1)) + 1 / (9 * n))
-            self._results["cpk_ci_lower"] = max(0, cpk - z * se_cpk)
-            self._results["cpk_ci_upper"] = cpk + z * se_cpk
+            if cpk is not None and np.isfinite(cpk):
+                se_cpk = np.sqrt(cpk**2 / (2 * (n - 1)) + 1 / (9 * n))
+                self._results["cpk_ci_lower"] = max(0, cpk - z * se_cpk)
+                self._results["cpk_ci_upper"] = cpk + z * se_cpk
 
         if "ppk" in self._results:
             ppk = self._results["ppk"]
-            se_ppk = np.sqrt(ppk**2 / (2 * (n - 1)) + 1 / (9 * n))
-            self._results["ppk_ci_lower"] = max(0, ppk - z * se_ppk)
-            self._results["ppk_ci_upper"] = ppk + z * se_ppk
+            if ppk is not None and np.isfinite(ppk):
+                se_ppk = np.sqrt(ppk**2 / (2 * (n - 1)) + 1 / (9 * n))
+                self._results["ppk_ci_lower"] = max(0, ppk - z * se_ppk)
+                self._results["ppk_ci_upper"] = ppk + z * se_ppk
 
         if "cp" in self._results:
             cp = self._results["cp"]
-            se_cp = cp * np.sqrt(1 / (2 * (n - 1)))
-            self._results["cp_ci_lower"] = cp / (1 + z * se_cp / cp)
-            self._results["cp_ci_upper"] = cp / (1 - z * se_cp / cp)
+            if cp is not None and cp > 0 and np.isfinite(cp):
+                se_cp = cp * np.sqrt(1 / (2 * (n - 1)))
+                denom_lo = 1 + z * se_cp / cp
+                denom_hi = 1 - z * se_cp / cp
+                if denom_lo > 0:
+                    self._results["cp_ci_lower"] = cp / denom_lo
+                if denom_hi > 0:
+                    self._results["cp_ci_upper"] = cp / denom_hi
 
     def _compute_ppm(self, mean, sigma_within, sigma_overall):
         if self.usl is not None:

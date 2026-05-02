@@ -7,10 +7,11 @@ class NormalityTests:
     """Tests de normalité: Shapiro-Wilk, Anderson-Darling, Kolmogorov-Smirnov,
     Lilliefors, D'Agostino-Pearson, Jarque-Bera, Ryan-Joiner."""
 
-    def __init__(self, data: np.ndarray, alpha: float = 0.05):
+    def __init__(self, data: np.ndarray, alpha: float = 0.05, chi2_df: int = None):
         self.data = np.array(data, dtype=float)
         self.data = self.data[~np.isnan(self.data)]
         self.alpha = alpha
+        self.chi2_df = chi2_df
         self._results: Dict[str, Any] = {}
         self._run_all_tests()
 
@@ -209,9 +210,14 @@ class NormalityTests:
                 return
 
             num_params_estimated = 2
-            df = len(observed_combined) - 1 - num_params_estimated
-            if df < 1:
+            df_auto = len(observed_combined) - 1 - num_params_estimated
+            if df_auto < 1:
                 return
+
+            if self.chi2_df is not None:
+                df = self.chi2_df
+            else:
+                df = df_auto
 
             chi2_stat = np.sum((observed_combined - expected_combined) ** 2 / expected_combined)
             p_value = 1.0 - stats.chi2.cdf(chi2_stat, df=df)
