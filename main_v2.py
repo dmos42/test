@@ -2925,16 +2925,179 @@ class StatisticalApp(QMainWindow):
         self._add_copy_button(result_layout, self.cc_result_text)
         left_layout.addWidget(result_group)
 
+
+    def _cc_make_subgroups(self, data, subgroup_size):
+        """Découpe les données en sous-groupes complets pour cartes Xbar-R / Xbar-S."""
+        x = np.asarray(data, dtype=float)
+        x = x[~np.isnan(x)]
+        if subgroup_size < 2:
+            raise ValueError("La taille de sous-groupe doit être au moins 2 pour les cartes X̄-R et X̄-S.")
+        n_groups = len(x) // subgroup_size
+        if n_groups < 2:
+            raise ValueError(
+                f"Données insuffisantes : il faut au moins 2 sous-groupes complets de taille {subgroup_size}."
+            )
+        used = n_groups * subgroup_size
+        ignored = len(x) - used
+        return x[:used].reshape(n_groups, subgroup_size), ignored
+
+    def _cc_constants(self, subgroup_size):
+        """Constantes usuelles pour cartes Xbar-R et Xbar-S, n=2..25."""
+        table = {
+            2:  {"A2": 1.880, "D3": 0.000, "D4": 3.267, "A3": 2.659, "B3": 0.000, "B4": 3.267},
+            3:  {"A2": 1.023, "D3": 0.000, "D4": 2.574, "A3": 1.954, "B3": 0.000, "B4": 2.568},
+            4:  {"A2": 0.729, "D3": 0.000, "D4": 2.282, "A3": 1.628, "B3": 0.000, "B4": 2.266},
+            5:  {"A2": 0.577, "D3": 0.000, "D4": 2.114, "A3": 1.427, "B3": 0.000, "B4": 2.089},
+            6:  {"A2": 0.483, "D3": 0.000, "D4": 2.004, "A3": 1.287, "B3": 0.030, "B4": 1.970},
+            7:  {"A2": 0.419, "D3": 0.076, "D4": 1.924, "A3": 1.182, "B3": 0.118, "B4": 1.882},
+            8:  {"A2": 0.373, "D3": 0.136, "D4": 1.864, "A3": 1.099, "B3": 0.185, "B4": 1.815},
+            9:  {"A2": 0.337, "D3": 0.184, "D4": 1.816, "A3": 1.032, "B3": 0.239, "B4": 1.761},
+            10: {"A2": 0.308, "D3": 0.223, "D4": 1.777, "A3": 0.975, "B3": 0.284, "B4": 1.716},
+            11: {"A2": 0.285, "D3": 0.256, "D4": 1.744, "A3": 0.927, "B3": 0.321, "B4": 1.679},
+            12: {"A2": 0.266, "D3": 0.283, "D4": 1.717, "A3": 0.886, "B3": 0.354, "B4": 1.646},
+            13: {"A2": 0.249, "D3": 0.307, "D4": 1.693, "A3": 0.850, "B3": 0.382, "B4": 1.618},
+            14: {"A2": 0.235, "D3": 0.328, "D4": 1.672, "A3": 0.817, "B3": 0.406, "B4": 1.594},
+            15: {"A2": 0.223, "D3": 0.347, "D4": 1.653, "A3": 0.789, "B3": 0.428, "B4": 1.572},
+            16: {"A2": 0.212, "D3": 0.363, "D4": 1.637, "A3": 0.763, "B3": 0.448, "B4": 1.552},
+            17: {"A2": 0.203, "D3": 0.378, "D4": 1.622, "A3": 0.739, "B3": 0.466, "B4": 1.534},
+            18: {"A2": 0.194, "D3": 0.391, "D4": 1.608, "A3": 0.718, "B3": 0.482, "B4": 1.518},
+            19: {"A2": 0.187, "D3": 0.403, "D4": 1.597, "A3": 0.698, "B3": 0.497, "B4": 1.503},
+            20: {"A2": 0.180, "D3": 0.415, "D4": 1.585, "A3": 0.680, "B3": 0.510, "B4": 1.490},
+            21: {"A2": 0.173, "D3": 0.425, "D4": 1.575, "A3": 0.663, "B3": 0.523, "B4": 1.477},
+            22: {"A2": 0.167, "D3": 0.434, "D4": 1.566, "A3": 0.647, "B3": 0.534, "B4": 1.466},
+            23: {"A2": 0.162, "D3": 0.443, "D4": 1.557, "A3": 0.633, "B3": 0.545, "B4": 1.455},
+            24: {"A2": 0.157, "D3": 0.451, "D4": 1.548, "A3": 0.619, "B3": 0.555, "B4": 1.445},
+            25: {"A2": 0.153, "D3": 0.459, "D4": 1.541, "A3": 0.606, "B3": 0.565, "B4": 1.435},
+        }
+        return table.get(int(subgroup_size), table[25])
+
+    def _cc_xbar_stats(self, data, subgroup_size, chart_kind):
+        """Calcule les statistiques et limites pour X̄-R ou X̄-S."""
+        groups, ignored = self._cc_make_subgroups(data, subgroup_size)
+        xbars = groups.mean(axis=1)
+        ranges = groups.max(axis=1) - groups.min(axis=1)
+        stds = groups.std(axis=1, ddof=1)
+        xbarbar = float(np.mean(xbars))
+        const = self._cc_constants(subgroup_size)
+
+        if chart_kind == "XBAR_R":
+            rbar = float(np.mean(ranges))
+            main = {
+                "values": xbars,
+                "center": xbarbar,
+                "ucl": xbarbar + const["A2"] * rbar,
+                "lcl": xbarbar - const["A2"] * rbar,
+                "ylabel": "Moyenne sous-groupe",
+                "title": "Carte X̄",
+            }
+            dispersion = {
+                "values": ranges,
+                "center": rbar,
+                "ucl": const["D4"] * rbar,
+                "lcl": const["D3"] * rbar,
+                "ylabel": "Étendue R",
+                "title": "Carte R",
+            }
+            method = f"X̄-R : limites X̄ = X̄̄ ± A2×R̄ ; limites R = D3/D4×R̄"
+        else:
+            sbar = float(np.mean(stds))
+            main = {
+                "values": xbars,
+                "center": xbarbar,
+                "ucl": xbarbar + const["A3"] * sbar,
+                "lcl": xbarbar - const["A3"] * sbar,
+                "ylabel": "Moyenne sous-groupe",
+                "title": "Carte X̄",
+            }
+            dispersion = {
+                "values": stds,
+                "center": sbar,
+                "ucl": const["B4"] * sbar,
+                "lcl": const["B3"] * sbar,
+                "ylabel": "Écart-type S",
+                "title": "Carte S",
+            }
+            method = f"X̄-S : limites X̄ = X̄̄ ± A3×S̄ ; limites S = B3/B4×S̄"
+
+        return {
+            "groups": groups,
+            "ignored": ignored,
+            "subgroup_size": subgroup_size,
+            "n_groups": len(groups),
+            "constants": const,
+            "main": main,
+            "dispersion": dispersion,
+            "method": method,
+        }
+
+    def _cc_count_ooc(self, values, lcl, ucl):
+        values = np.asarray(values, dtype=float)
+        return int(np.sum((values > ucl) | (values < lcl)))
+
     def _run_control_charts(self):
         data, col_name = self._get_combo_data(self.cc_col_combo)
         if data is None:
             QMessageBox.warning(self, "Attention", "Sélectionnez une colonne")
             return
         try:
+            data = np.asarray(data, dtype=float)
+            data = data[~np.isnan(data)]
+            if len(data) < 2:
+                QMessageBox.warning(self, "Attention", "Au moins 2 valeurs numériques sont nécessaires.")
+                return
+
             cc_type = self.cc_type.currentText()
             subgroup = self.cc_subgroup.value()
             lines = ["=" * 60, f"CARTE DE CONTRÔLE : {cc_type}", "=" * 60,
                      f"\nColonne : {col_name}", f"N = {len(data)}"]
+
+            # Normalisation des libellés : l'interface contient X̄-R et X̄-S.
+            if cc_type in ("X̄-R", "Xbar-R", "X-R"):
+                stats_xr = self._cc_xbar_stats(data, subgroup, "XBAR_R")
+                main = stats_xr["main"]
+                disp = stats_xr["dispersion"]
+                lines.append(f"\n{stats_xr['method']}")
+                lines.append(f"Sous-groupe = {subgroup}")
+                lines.append(f"Sous-groupes complets utilisés = {stats_xr['n_groups']}")
+                if stats_xr["ignored"]:
+                    lines.append(f"Observations ignorées faute de sous-groupe complet = {stats_xr['ignored']}")
+                c = stats_xr["constants"]
+                lines.append(f"Constantes : A2={c['A2']:.3f}, D3={c['D3']:.3f}, D4={c['D4']:.3f}")
+                lines.append(f"\nCarte X̄ : CL={main['center']:.6f}, UCL={main['ucl']:.6f}, LCL={main['lcl']:.6f}")
+                lines.append(f"Carte R : CL={disp['center']:.6f}, UCL={disp['ucl']:.6f}, LCL={disp['lcl']:.6f}")
+                lines.append(f"\nPoints hors contrôle X̄ : {self._cc_count_ooc(main['values'], main['lcl'], main['ucl'])}/{len(main['values'])}")
+                lines.append(f"Points hors contrôle R : {self._cc_count_ooc(disp['values'], disp['lcl'], disp['ucl'])}/{len(disp['values'])}")
+                rules = self._detect_control_rules(main["values"], main["center"], (main["ucl"] - main["center"]) / 3 if main["ucl"] != main["center"] else 0)
+                lines.append("\nRègles sur la carte X̄ :")
+                lines.extend(rules if rules else ["  Aucun signal détecté"])
+                self.cc_result_text.setText("\n".join(lines))
+                self._plot_control_charts(data, cc_type, subgroup)
+                self._refresh_report_panel()
+                return
+
+            if cc_type in ("X̄-S", "Xbar-S", "X-S"):
+                stats_xs = self._cc_xbar_stats(data, subgroup, "XBAR_S")
+                main = stats_xs["main"]
+                disp = stats_xs["dispersion"]
+                lines.append(f"\n{stats_xs['method']}")
+                lines.append(f"Sous-groupe = {subgroup}")
+                lines.append(f"Sous-groupes complets utilisés = {stats_xs['n_groups']}")
+                if stats_xs["ignored"]:
+                    lines.append(f"Observations ignorées faute de sous-groupe complet = {stats_xs['ignored']}")
+                c = stats_xs["constants"]
+                lines.append(f"Constantes : A3={c['A3']:.3f}, B3={c['B3']:.3f}, B4={c['B4']:.3f}")
+                lines.append(f"\nCarte X̄ : CL={main['center']:.6f}, UCL={main['ucl']:.6f}, LCL={main['lcl']:.6f}")
+                lines.append(f"Carte S : CL={disp['center']:.6f}, UCL={disp['ucl']:.6f}, LCL={disp['lcl']:.6f}")
+                lines.append(f"\nPoints hors contrôle X̄ : {self._cc_count_ooc(main['values'], main['lcl'], main['ucl'])}/{len(main['values'])}")
+                lines.append(f"Points hors contrôle S : {self._cc_count_ooc(disp['values'], disp['lcl'], disp['ucl'])}/{len(disp['values'])}")
+                rules = self._detect_control_rules(main["values"], main["center"], (main["ucl"] - main["center"]) / 3 if main["ucl"] != main["center"] else 0)
+                lines.append("\nRègles sur la carte X̄ :")
+                lines.extend(rules if rules else ["  Aucun signal détecté"])
+                self.cc_result_text.setText("\n".join(lines))
+                self._plot_control_charts(data, cc_type, subgroup)
+                self._refresh_report_panel()
+                return
+
             mean_val = np.mean(data)
             std_val = np.std(data, ddof=1) if len(data) > 1 else 0
             plotted = data
@@ -3017,8 +3180,50 @@ class StatisticalApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
 
+    def _plot_xbar_control_pair(self, stats_dict, chart_label):
+        """Trace la paire de cartes X̄-R ou X̄-S."""
+        self.cc_canvas.fig.clear()
+        ax1 = self.cc_canvas.fig.add_subplot(211)
+        ax2 = self.cc_canvas.fig.add_subplot(212)
+        x = np.arange(1, stats_dict["n_groups"] + 1)
+
+        for ax, item in [(ax1, stats_dict["main"]), (ax2, stats_dict["dispersion"] )]:
+            values = np.asarray(item["values"], dtype=float)
+            ax.plot(x, values, "bo-", markersize=4, linewidth=1)
+            ax.axhline(item["center"], color="green", linestyle="--", label=f"CL={item['center']:.4g}")
+            ax.axhline(item["ucl"], color="red", linestyle="-.", label=f"UCL={item['ucl']:.4g}")
+            ax.axhline(item["lcl"], color="red", linestyle="-.", label=f"LCL={item['lcl']:.4g}")
+            bad = np.where((values > item["ucl"]) | (values < item["lcl"]))[0]
+            if len(bad):
+                ax.scatter(x[bad], values[bad], color="red", s=45, zorder=5, label="Hors contrôle")
+            ax.set_title(item["title"])
+            ax.set_xlabel("Sous-groupe")
+            ax.set_ylabel(item["ylabel"])
+            ax.grid(True, alpha=0.25)
+            ax.legend(fontsize=8)
+
+        self.cc_canvas.fig.suptitle(chart_label, fontsize=12, fontweight="bold")
+        try:
+            self.cc_canvas.fig.tight_layout(rect=[0, 0, 1, 0.96])
+        except Exception:
+            pass
+        self.cc_canvas.draw()
+
     def _plot_control_charts(self, data, cc_type, subgroup):
         self.cc_canvas.fig.clear()
+        data = np.asarray(data, dtype=float)
+        data = data[~np.isnan(data)]
+
+        if cc_type in ("X̄-R", "Xbar-R", "X-R"):
+            stats_xr = self._cc_xbar_stats(data, subgroup, "XBAR_R")
+            self._plot_xbar_control_pair(stats_xr, f"Carte X̄-R — sous-groupe {subgroup}")
+            return
+
+        if cc_type in ("X̄-S", "Xbar-S", "X-S"):
+            stats_xs = self._cc_xbar_stats(data, subgroup, "XBAR_S")
+            self._plot_xbar_control_pair(stats_xs, f"Carte X̄-S — sous-groupe {subgroup}")
+            return
+
         mean_val = np.mean(data)
         std_val = np.std(data, ddof=1) if len(data) > 1 else 0
         if cc_type in ["P", "U", "C"]:
@@ -3056,10 +3261,12 @@ class StatisticalApp(QMainWindow):
             ax.set_title(f"Carte {cc_type}")
             ax.set_ylabel(ylabel)
             ax.set_xlabel("Observation")
+            ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8)
             self.cc_canvas.fig.tight_layout()
             self.cc_canvas.draw()
             return
+
         ucl = mean_val + 3 * std_val
         lcl = mean_val - 3 * std_val
         if cc_type == "EWMA":
@@ -3076,13 +3283,14 @@ class StatisticalApp(QMainWindow):
             ax1.plot(range(len(data)), data, "bo-", markersize=3, alpha=0.5, label="Données")
             ax1.axhline(mean_val, color="green", linestyle="--", label="CL")
             ax1.set_title("Données individuelles")
+            ax1.grid(True, alpha=0.25)
             ax1.legend(fontsize=7)
             ax2.plot(range(1, len(data)+1), z, "ro-", markersize=3, label="EWMA")
-            ax2.fill_between(range(1, len(data)+1), lcl_ewma, ucl_ewma, alpha=0.15, color="red", label="Limites")
             ax2.plot(range(1, len(data)+1), ucl_ewma, "r--", linewidth=1, label="UCL")
             ax2.plot(range(1, len(data)+1), lcl_ewma, "r--", linewidth=1, label="LCL")
-            ax2.axhline(mean_val, color="green", linestyle="--", linewidth=1)
-            ax2.set_title(f"Carte EWMA (λ={lam:.2f})")
+            ax2.axhline(mean_val, color="green", linestyle="--", label="CL")
+            ax2.set_title("Carte EWMA")
+            ax2.grid(True, alpha=0.25)
             ax2.legend(fontsize=7)
         elif cc_type == "CUSUM":
             k = self.cc_k.value() * std_val
@@ -3094,50 +3302,35 @@ class StatisticalApp(QMainWindow):
                 s_neg[i] = max(0, s_neg[i-1] + mean_val - data[i] - k)
             ax1 = self.cc_canvas.fig.add_subplot(211)
             ax2 = self.cc_canvas.fig.add_subplot(212)
-            ax1.plot(range(len(data)), data, "bo-", markersize=3, alpha=0.5)
-            ax1.axhline(mean_val, color="green", linestyle="--", label="CL")
-            ax1.set_title("Données individuelles")
+            ax1.plot(range(1, len(data)+1), s_pos, "b-", label="CUSUM+")
+            ax1.axhline(h, color="red", linestyle="--", label="h")
+            ax1.set_title("CUSUM positif")
+            ax1.grid(True, alpha=0.25)
             ax1.legend(fontsize=7)
-            ax2.plot(range(len(data)), s_pos, "r-", markersize=2, label="CUSUM+")
-            ax2.plot(range(len(data)), s_neg, "b-", markersize=2, label="CUSUM-")
-            ax2.axhline(h, color="red", linestyle="--", linewidth=1, label="h")
-            ax2.axhline(0, color="green", linestyle="--", linewidth=1)
-            ax2.set_title(f"Carte CUSUM (k={k:.3f}, h={h:.3f})")
+            ax2.plot(range(1, len(data)+1), s_neg, "m-", label="CUSUM-")
+            ax2.axhline(h, color="red", linestyle="--", label="h")
+            ax2.set_title("CUSUM négatif")
+            ax2.grid(True, alpha=0.25)
             ax2.legend(fontsize=7)
-        elif cc_type in ["X̄-R", "X̄-S"]:
-            ax1 = self.cc_canvas.fig.add_subplot(211)
-            ax2 = self.cc_canvas.fig.add_subplot(212)
-            n_subgroups = len(data) // subgroup
-            if n_subgroups < 2:
-                ax1.text(0.5, 0.5, "Pas assez de données pour les sous-groupes", ha="center", va="center")
-            else:
-                subgroups = data[:n_subgroups * subgroup].reshape(n_subgroups, subgroup)
-                means = np.mean(subgroups, axis=1)
-                ranges = np.ptp(subgroups, axis=1)
-                ax1.plot(range(len(means)), means, "bo-", markersize=4)
-                ax1.axhline(np.mean(means), color="green", linestyle="--", label="CL")
-                ax1.axhline(np.mean(means) + 3 * np.std(means, ddof=1), color="red", linestyle="-.", label="UCL")
-                ax1.axhline(np.mean(means) - 3 * np.std(means, ddof=1), color="red", linestyle="-.", label="LCL")
-                ax1.set_title(f"Carte {cc_type.split('-')[0]}")
-                ax1.legend(fontsize=7)
-                ax2.plot(range(len(ranges)), ranges, "bo-", markersize=4)
-                ax2.axhline(np.mean(ranges), color="green", linestyle="--")
-                ax2.set_title("Carte R")
         else:
-            ax1 = self.cc_canvas.fig.add_subplot(211)
-            ax2 = self.cc_canvas.fig.add_subplot(212)
-            ax1.plot(range(1, len(data) + 1), data, "bo-", markersize=3)
-            ax1.axhline(mean_val, color="green", linestyle="--", label="CL")
-            ax1.axhline(ucl, color="red", linestyle="-.", label="UCL")
-            ax1.axhline(lcl, color="red", linestyle="-.", label="LCL")
+            ax = self.cc_canvas.fig.add_subplot(111)
+            ax.plot(range(1, len(data) + 1), data, "bo-", markersize=4)
+            ax.axhline(mean_val, color="green", linestyle="--", label="CL")
+            ax.axhline(ucl, color="red", linestyle="-.", label="UCL")
+            ax.axhline(lcl, color="red", linestyle="-.", label="LCL")
             bad = np.where((data > ucl) | (data < lcl))[0]
             if len(bad):
-                ax1.scatter(bad + 1, data[bad], color="red", s=35, zorder=5)
-            ax1.set_title(f"Carte {cc_type}")
-            ax1.legend(fontsize=7)
-            ax2.hist(data, bins=20, density=True, alpha=0.6, color="lightblue")
-            ax2.set_title("Distribution")
-        self.cc_canvas.fig.tight_layout()
+                ax.scatter(bad + 1, data[bad], color="red", s=40, zorder=5, label="Hors contrôle")
+            ax.set_title(f"Carte {cc_type}")
+            ax.set_xlabel("Observation")
+            ax.set_ylabel("Valeur")
+            ax.grid(True, alpha=0.25)
+            ax.legend(fontsize=8)
+
+        try:
+            self.cc_canvas.fig.tight_layout()
+        except Exception:
+            pass
         self.cc_canvas.draw()
 
     def _create_probplot_tab(self):
