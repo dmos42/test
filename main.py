@@ -3,6 +3,8 @@ import os
 import json
 import tempfile
 import shutil
+from pathlib import Path
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -34,142 +36,30 @@ from stats_engine.probability_plots import ProbabilityPlot
 from stats_engine.msa import GageRRStudy
 from stats_engine.export import ReportExporter
 
-
-
-# ===== MINIQUAL CORE COPIÉ DE core.py =====
-from pathlib import Path
-from datetime import datetime
-import json, math
-import numpy as np, pandas as pd
-from scipy import stats
-import matplotlib.pyplot as plt
-SUPPORTED_DISTRIBUTIONS=['normal','lognormal','weibull','gamma','exponential']
-LABEL={'normal':'normale','lognormal':'lognormale','weibull':'Weibull','gamma':'gamma','exponential':'exponentielle'}
-def read_table(path, sheet_name=0):
-    p=Path(path); s=p.suffix.lower()
-    if s=='.csv': df=pd.read_csv(p,sep=None,engine='python',encoding='utf-8-sig')
-    elif s in ['.xlsx','.xlsm']: df=pd.read_excel(p,sheet_name=sheet_name,engine='openpyxl')
-    elif s=='.xls': df=pd.read_excel(p,sheet_name=sheet_name)
-    else: raise ValueError('Format non supporté: '+s)
-    df.columns=[str(c).lstrip('\ufeff').strip() for c in df.columns]; return df
-def numeric_series(df,col):
-    if col not in df.columns: raise KeyError(f'Colonne introuvable: {col}. Colonnes: {list(df.columns)}')
-    s=pd.to_numeric(df[col],errors='coerce').dropna()
-    if s.empty: raise ValueError('Aucune valeur numérique exploitable')
-    return s
-def descriptive(s):
-    s=pd.to_numeric(s,errors='coerce').dropna(); return {'n':len(s),'moyenne':float(s.mean()),'mediane':float(s.median()),'ecart_type_echantillon':float(s.std(ddof=1)),'minimum':float(s.min()),'q1':float(s.quantile(.25)),'q3':float(s.quantile(.75)),'maximum':float(s.max())}
-def _pos(x,d):
-    if d in ['lognormal','weibull','gamma']: return x[x>0]
-    if d=='exponential': return x[x>=0]
-    return x
-def _dist(d): return {'normal':stats.norm,'lognormal':stats.lognorm,'weibull':stats.weibull_min,'gamma':stats.gamma,'exponential':stats.expon}[d]
-def _name(d): return {'normal':'norm','lognormal':'lognorm','weibull':'weibull_min','gamma':'gamma','exponential':'expon'}[d]
-def fit_distribution(series,d):
-    x=pd.Series(series).dropna().astype(float).to_numpy(); xp=_pos(x,d)
-    if len(xp)<3: return {'loi':d,'p_value':np.nan,'statistique':np.nan,'paramètres':'Données incompatibles','params':None}
-    params=stats.norm.fit(xp) if d=='normal' else _dist(d).fit(xp,floc=0)
-    D,p=stats.kstest(xp,_name(d),args=params)
-    return {'loi':d,'p_value':float(p),'statistique':float(D),'paramètres':str(tuple(round(float(v),6) for v in params)),'params':params}
-def distribution_pvalues(s): return sorted([{k:v for k,v in fit_distribution(s,d).items() if k!='params'} for d in SUPPORTED_DISTRIBUTIONS], key=lambda r:(-1 if r['p_value']!=r['p_value'] else -r['p_value']))
-def chi_square_gof(s, distribution='normal', bins='auto'):
-    x=pd.Series(s).dropna().astype(float).to_numpy(); n=len(x)
-    if n<10: return {'Test':'Khi²','Loi testée':distribution,'Statistique':np.nan,'ddl':np.nan,'p-value':np.nan,'Lecture':'Effectif insuffisant (<10)','Classes':'n/a'}
-    k=max(4,min(10,int(np.sqrt(n)))) if str(bins)=='auto' else int(bins)
-    fit=fit_distribution(x,distribution); p=fit.get('params')
-    if p is None: return {'Test':'Khi²','Loi testée':distribution,'Statistique':np.nan,'ddl':np.nan,'p-value':np.nan,'Lecture':'Paramètres non estimables','Classes':'n/a'}
-    edges=_dist(distribution).ppf(np.linspace(0,1,k+1),*p); edges[0],edges[-1]=-np.inf,np.inf
-    obs,_=np.histogram(x,bins=edges); exp=np.ones(k)*n/k; chi=float(((obs-exp)**2/exp).sum()); ddl=max(1,k-1-len(p)); pv=float(stats.chi2.sf(chi,ddl))
-    return {'Test':'Khi²','Loi testée':distribution,'Statistique':chi,'ddl':ddl,'p-value':pv,'Lecture':'Compatible avec la loi testée' if pv>0.05 else 'Écart possible avec la loi testée','Classes':k}
-def boxcox_transform(s,lsl=None,usl=None,target=None):
-    x=pd.Series(s).dropna().astype(float); shift=0.0
-    if x.min()<=0: shift=float(abs(x.min())+1e-6)
-    y,lam=stats.boxcox(x+shift)
-    def tr(v):
-        if v is None: return None
-        vv=float(v)+shift; return float(stats.boxcox([vv],lmbda=lam)[0]) if vv>0 else None
-    return pd.Series(y,index=x.index),tr(lsl),tr(usl),tr(target),{'Box-Cox lambda':float(lam),'Décalage appliqué':shift}
-def validate_capability(df,col,lsl=None,usl=None,target=None,subgroup=None,distribution='normal'):
-    rows=[]; add=lambda n,m: rows.append({'Niveau':n,'Message':m})
-    if col not in df.columns: add('ERREUR',f'Colonne mesure introuvable: {col}'); return rows
-    s=pd.to_numeric(df[col],errors='coerce'); n=s.notna().sum(); bad=len(df)-n
-    add('OK',f'Colonne mesure trouvée: {col}'); add('OK',f'{int(n)} valeurs numériques exploitables sur {len(df)} lignes')
-    if bad: add('AVERTISSEMENT',f'{int(bad)} valeurs vides ou non numériques seront ignorées')
-    if n<10: add('ERREUR','Moins de 10 valeurs numériques: analyse non robuste')
-    elif n<30: add('AVERTISSEMENT','Moins de 30 valeurs: interprétation prudente')
-    if lsl is None and usl is None: add('ERREUR','Aucune limite de spécification renseignée')
-    if lsl is not None and usl is not None and usl<=lsl: add('ERREUR','USL doit être strictement supérieure à LSL')
-    if target is not None and lsl is not None and usl is not None and not(lsl<=target<=usl): add('AVERTISSEMENT','La cible est hors intervalle [LSL;USL]')
-    if subgroup and subgroup not in df.columns: add('AVERTISSEMENT',f'Sous-groupe introuvable: {subgroup}. Calcul sans sous-groupe')
-    vals=s.dropna()
-    if distribution in ['lognormal','weibull','gamma'] and (vals<=0).any(): add('AVERTISSEMENT',f'Loi {distribution}: des valeurs <=0 sont incompatibles avec cette loi')
-    if distribution=='exponential' and (vals<0).any(): add('AVERTISSEMENT','Loi exponentielle: des valeurs <0 sont incompatibles')
-    return rows
-def status(rows): return 'BLOQUÉ' if any(r['Niveau']=='ERREUR' for r in rows) else ('OK AVEC AVERTISSEMENT' if any(r['Niveau']=='AVERTISSEMENT' for r in rows) else 'OK')
-def capability(s,lsl=None,usl=None,target=None,subgroup=None):
-    x=pd.Series(s).dropna().astype(float); m=float(x.mean()); so=float(x.std(ddof=1)); mr=x.diff().abs().dropna(); sw=float(mr.mean()/1.128) if len(mr) and mr.mean()>0 else so
-    if lsl is None and usl is None: raise ValueError('Renseigner LSL ou USL')
-    if lsl is not None and usl is not None and target is None: target=(lsl+usl)/2
-    cu=(usl-m)/(3*sw) if usl is not None and sw>0 else None; cl=(m-lsl)/(3*sw) if lsl is not None and sw>0 else None
-    pu=(usl-m)/(3*so) if usl is not None and so>0 else None; pl=(m-lsl)/(3*so) if lsl is not None and so>0 else None
-    cp=(usl-lsl)/(6*sw) if lsl is not None and usl is not None and sw>0 else None; pp=(usl-lsl)/(6*so) if lsl is not None and usl is not None and so>0 else None
-    valid=lambda v: v is not None and not np.isnan(v)
-    mask=pd.Series(False,index=x.index)
-    if lsl is not None: mask|=x<lsl
-    if usl is not None: mask|=x>usl
-    return {'n':len(x),'mean':m,'stdev_within':sw,'stdev_overall':so,'lsl':lsl,'usl':usl,'target':target,'cp':cp,'cpk':min([v for v in [cu,cl] if valid(v)]) if any(valid(v) for v in [cu,cl]) else None,'cpk_upper':cu,'cpk_lower':cl,'pp':pp,'ppk':min([v for v in [pu,pl] if valid(v)]) if any(valid(v) for v in [pu,pl]) else None,'ppk_upper':pu,'ppk_lower':pl,'ppm_below_lsl':float(stats.norm.cdf((lsl-m)/so)*1e6) if lsl is not None and so>0 else None,'ppm_above_usl':float((1-stats.norm.cdf((usl-m)/so))*1e6) if usl is not None and so>0 else None,'observed_nc_count':int(mask.sum()),'observed_nc_percent':float(mask.mean()*100),'spec_mode':'Bilatéral LSL+USL' if lsl is not None and usl is not None else ('Unilatéral supérieur USL' if usl is not None else 'Unilatéral inférieur LSL')}
-def outlier_tests(s,alpha=.05,z_threshold=3.0):
-    x=pd.Series(s).dropna().astype(float); q1,q3=x.quantile(.25),x.quantile(.75); iqr=q3-q1; lo,hi=q1-1.5*iqr,q3+1.5*iqr; oi=x[(x<lo)|(x>hi)]
-    z=(x-x.mean())/x.std(ddof=1) if x.std(ddof=1)>0 else x*0; oz=x[z.abs()>z_threshold]
-    return {'table':[{'Méthode':'IQR','Seuil / statistique':f'[{lo:.6g}; {hi:.6g}]','Valeurs détectées':', '.join(map(str,oi.tolist()[:12])) if len(oi) else 'Aucune','Nombre':len(oi)},{'Méthode':f'Z-score absolu > {z_threshold:g}','Seuil / statistique':f'|Z| > {z_threshold:g}','Valeurs détectées':', '.join(map(str,oz.tolist()[:12])) if len(oz) else 'Aucune','Nombre':len(oz)}], 'values_to_exclude':list(set(map(float,oi)).union(set(map(float,oz))))}
-def normality_tests(s,alpha=.05):
-    x=pd.Series(s).dropna().astype(float).to_numpy(); sh,shp=stats.shapiro(x if len(x)<=5000 else pd.Series(x).sample(5000,random_state=42)); ks,ksp=stats.kstest(x,'norm',args=(np.mean(x),np.std(x,ddof=1))); ad=stats.anderson(x,'norm'); crit=float(ad.critical_values[2]); ok=[shp>alpha,ksp>alpha,float(ad.statistic)<crit]
-    return {'table':[{'Test':'Shapiro-Wilk','Statistique':float(sh),'p-value / seuil':float(shp),'Lecture':'Compatible avec une loi normale' if ok[0] else 'Écart possible à la normalité'},{'Test':'Kolmogorov-Smirnov','Statistique':float(ks),'p-value / seuil':float(ksp),'Lecture':'Compatible avec une loi normale' if ok[1] else 'Écart possible à la normalité'},{'Test':'Anderson-Darling','Statistique':float(ad.statistic),'p-value / seuil':f'Critique 5% : {crit:.6g}','Lecture':'Compatible avec une loi normale' if ok[2] else 'Écart possible à la normalité'}],'favorable_count':int(sum(ok)),'global_ok':sum(ok)>=2}
-def nonnormal_capability(s,lsl=None,usl=None):
-    x=pd.Series(s).dropna().astype(float); lo=x.quantile(.00135); hi=x.quantile(.99865); med=x.median(); out={'méthode':'Percentiles empiriques 0,135% / 99,865%','q0_135':float(lo),'q99_865':float(hi),'mediane':float(med)}
-    if lsl is not None and usl is not None and hi>lo: out['CNp']=float((usl-lsl)/(hi-lo)); out['CNpk']=float(min((usl-med)/(hi-med),(med-lsl)/(med-lo))) if hi!=med and med!=lo else None
-    return out
-def dashboard(s,res,out,normality=None,distribution='normal',accept=1.33,excellent=1.67):
-    data=pd.Series(s).dropna().astype(float).to_numpy(); m=np.mean(data); sd=np.std(data,ddof=1); fig,ax=plt.subplots(2,2,figsize=(15,12)); fig.suptitle('Analyse de capabilité du procédé',fontsize=18,fontweight='bold')
-    a=ax[0,0]; a.hist(data,bins=min(15,max(5,int(np.sqrt(len(data))))),density=True,alpha=.75,edgecolor='black'); xs=[data.min(),data.max(),m-4*sd,m+4*sd]+[v for v in [res.get('lsl'),res.get('usl'),res.get('target')] if v is not None]; xx=np.linspace(min(xs),max(xs),300); fit=fit_distribution(data,distribution); p=fit.get('params')
-    if p is not None: a.plot(xx,_dist(distribution).pdf(xx,*p),'r-',label=f"Courbe {LABEL.get(distribution,distribution)} estimée")
-    for key,c,lab,ls in [('lsl','green','LSL','--'),('usl','red','USL','--'),('target','purple','Cible',':')]:
-        if res.get(key) is not None: a.axvline(res[key],color=c,ls=ls,label=f'{lab}={res[key]:.3g}')
-    a.axvline(m,color='orange',label=f'Moyenne={m:.3g}'); a.legend(fontsize=9); a.set_title('Distribution')
-    ax[0,1].boxplot(data); ax[0,1].set_title('Boxplot')
-    qfit=fit_distribution(data,distribution); p=qfit.get('params')
-    if p is not None:
-        probs=(np.arange(1,len(data)+1)-.5)/len(data); q=_dist(distribution).ppf(probs,*p); ordered=np.sort(_pos(data,distribution)); ax[1,0].scatter(q,ordered); lo=min(q.min(),ordered.min()); hi=max(q.max(),ordered.max()); ax[1,0].plot([lo,hi],[lo,hi],'r-')
-    ax[1,0].set_title(f"Q-Q plot — {LABEL.get(distribution,distribution)}")
-    labels=[]; vals=[]
-    for lab,key in [('Cp','cp'),('Cpk inf.','cpk_lower'),('Cpk sup.','cpk_upper'),('Cpk global','cpk')]:
-        if res.get(key) is not None: labels.append(lab); vals.append(res[key])
-    ax[1,1].bar(labels,vals); ax[1,1].axhline(accept,color='orange',ls='--'); ax[1,1].axhline(excellent,color='green',ls='--'); ax[1,1].set_title('Indices')
-    fig.tight_layout(rect=[0,0,1,.96]); fig.savefig(out,dpi=180,bbox_inches='tight'); plt.close(fig)
-def write_excel(path,sheets):
-    with pd.ExcelWriter(path,engine='openpyxl') as w:
-        for n,d in sheets.items(): (pd.DataFrame([d]) if isinstance(d,dict) else pd.DataFrame(d)).to_excel(w,sheet_name=str(n)[:31],index=False)
-def write_docx(title,sections,path,signature=None):
-    from docx import Document
-    from docx.shared import Inches
-    doc=Document(); doc.add_heading(title,0); doc.add_paragraph('MiniQual Python v7.5.2 — '+datetime.now().strftime('%d/%m/%Y %H:%M'))
-    for name,content in sections:
-        doc.add_heading(name,1)
-        if isinstance(content,dict):
-            t=doc.add_table(rows=1,cols=2); t.style='Table Grid'; t.rows[0].cells[0].text='Indicateur'; t.rows[0].cells[1].text='Valeur'
-            for k,v in content.items(): c=t.add_row().cells; c[0].text=str(k); c[1].text='' if v is None else str(v)
-        elif isinstance(content,list) and content:
-            cols=list(content[0].keys()); t=doc.add_table(rows=1,cols=len(cols)); t.style='Table Grid'
-            for i,c0 in enumerate(cols): t.rows[0].cells[i].text=str(c0)
-            for row in content:
-                c=t.add_row().cells
-                for i,c0 in enumerate(cols): c[i].text=str(row.get(c0,''))
-        elif str(content).endswith('.png') and Path(content).exists(): doc.add_picture(str(content),width=Inches(6.7))
-        else: doc.add_paragraph(str(content))
-    doc.save(path)
-def save_project(path,settings):
-    p=Path(path); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps({k:(str(v) if callable(v) else v) for k,v in settings.items() if k!='func'},ensure_ascii=False,indent=2),encoding='utf-8')
-def load_project(path): return json.loads(Path(path).read_text(encoding='utf-8'))
+try:
+    # Structure recommandée : stats_engine/miniqual.py
+    from stats_engine.miniqual import (
+        SUPPORTED_DISTRIBUTIONS, LABEL,
+        read_table, numeric_series, descriptive,
+        fit_distribution, distribution_pvalues, chi_square_gof,
+        boxcox_transform, validate_capability, status,
+        capability, outlier_tests, normality_tests,
+        nonnormal_capability, dashboard,
+        write_excel, write_docx,
+        save_project, load_project,
+    )
+except ImportError:
+    # Structure séparée simple : miniqual.py à côté de main.py
+    from miniqual import (
+        SUPPORTED_DISTRIBUTIONS, LABEL,
+        read_table, numeric_series, descriptive,
+        fit_distribution, distribution_pvalues, chi_square_gof,
+        boxcox_transform, validate_capability, status,
+        capability, outlier_tests, normality_tests,
+        nonnormal_capability, dashboard,
+        write_excel, write_docx,
+        save_project, load_project,
+    )
 
 # ===== FIN MINIQUAL CORE =====
 
@@ -1069,26 +959,6 @@ class StatisticalApp(QMainWindow):
         self.tabs.addTab(tab, "Données")
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(2, 2, 2, 2)
-
-        info_label = QLabel(
-            "Données — saisissez ou collez vos mesures dans le tableur. "
-            "Sélectionnez ensuite les colonnes dans les onglets d'analyse. "
-            "Les colonnes sont nommées A, B, C…"
-        )
-        info_label.setStyleSheet("""
-            QLabel {
-                background-color: #fff3b0;
-                color: #1b1b1b;
-                padding: 8px 10px;
-                border: 1px solid #b49b00;
-                border-radius: 3px;
-                font-weight: bold;
-                font-size: 12px;
-            }
-        """)
-        info_label.setMinimumHeight(34)
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
 
         data_splitter = QSplitter(Qt.Vertical)
         data_splitter.setChildrenCollapsible(False)
@@ -3888,35 +3758,90 @@ class StatisticalApp(QMainWindow):
         self._refresh_report_panel()
         self.status_bar.showMessage("Nouveau projet")
 
+    def _json_safe(self, obj):
+        """Convertit récursivement les objets non JSON natifs pour éviter les plantages à l'enregistrement."""
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, bool)):
+            return obj
+        if isinstance(obj, float):
+            return obj if np.isfinite(obj) else None
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            value = float(obj)
+            return value if np.isfinite(value) else None
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (pd.Timestamp, datetime)):
+            return obj.isoformat()
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): self._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_safe(v) for v in obj]
+        if isinstance(obj, np.ndarray):
+            return self._json_safe(obj.tolist())
+        if isinstance(obj, pd.DataFrame):
+            return self._json_safe(obj.to_dict(orient="list"))
+        if isinstance(obj, pd.Series):
+            return self._json_safe(obj.tolist())
+        return str(obj)
+
     def _project_payload(self):
         results = {}
         for name in ["cap", "norm", "out", "cc", "prob", "reg", "tt", "anova", "corr", "boxplot", "msa", "dist"]:
             attr = f"{name}_result_text"
             if hasattr(self, attr):
                 results[name] = getattr(self, attr).toPlainText()
-        return {
-            "version": 1,
-            "theme": self.current_theme,
+        payload = {
+            "version": 2,
+            "theme": getattr(self, "current_theme", "Clair"),
             "data": self._sheet_to_dataframe().to_dict(orient="list"),
             "results": results,
             "report": self.report_text.toPlainText() if hasattr(self, "report_text") else "",
         }
+        return self._json_safe(payload)
+
 
     def _save_project(self):
         if not self.current_project_path:
             return self._save_project_as()
-        with open(self.current_project_path, "w", encoding="utf-8") as f:
-            json.dump(self._project_payload(), f, ensure_ascii=False, indent=2)
-        self.status_bar.showMessage(f"Projet enregistré : {self.current_project_path}")
+        try:
+            payload = self._project_payload()
+            target = Path(self.current_project_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = target.with_suffix(target.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
+            os.replace(tmp_path, target)
+            self.status_bar.showMessage(f"Projet enregistré : {self.current_project_path}")
+            return True
+        except Exception as e:
+            try:
+                tmp_path = Path(str(self.current_project_path) + ".tmp")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Erreur", f"Impossible d'enregistrer le projet :\n{e}")
+            return False
+
 
     def _save_project_as(self):
         filepath, _ = QFileDialog.getSaveFileName(self, "Enregistrer projet", "", "Projet StatPro (*.statpro);;JSON (*.json)")
         if not filepath:
-            return
+            return False
         if not filepath.lower().endswith((".statpro", ".json")):
             filepath += ".statpro"
+        previous_path = self.current_project_path
         self.current_project_path = filepath
-        self._save_project()
+        ok = self._save_project()
+        if not ok:
+            self.current_project_path = previous_path
+        return ok
+
 
     def _open_project(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Ouvrir projet", "", "Projet StatPro (*.statpro *.json);;All files (*)")
@@ -4087,6 +4012,93 @@ class StatisticalApp(QMainWindow):
             "Cartes de contrôle": self.cc_canvas, "Graphiques probabilité": self.prob_canvas, "MSA / Gage R&R": self.msa_canvas,
         }
 
+
+    def _scale_figure_text_for_export(self, fig, min_sizes=None):
+        """Augmente temporairement les tailles de texte d'une figure pour les exports Word/PDF."""
+        if min_sizes is None:
+            min_sizes = {
+                "title": 16,
+                "label": 13,
+                "tick": 11,
+                "legend": 11,
+                "annotation": 11,
+                "suptitle": 18,
+            }
+        saved = []
+
+        def set_min_font(text_obj, min_size):
+            if text_obj is None:
+                return
+            try:
+                old = text_obj.get_fontsize()
+                saved.append((text_obj, old))
+                text_obj.set_fontsize(max(float(old), float(min_size)))
+            except Exception:
+                pass
+
+        for txt in getattr(fig, "texts", []):
+            set_min_font(txt, min_sizes["suptitle"])
+
+        for ax in getattr(fig, "axes", []):
+            set_min_font(ax.title, min_sizes["title"])
+            set_min_font(ax.xaxis.label, min_sizes["label"])
+            set_min_font(ax.yaxis.label, min_sizes["label"])
+            for tick in ax.get_xticklabels() + ax.get_yticklabels():
+                set_min_font(tick, min_sizes["tick"])
+            leg = ax.get_legend()
+            if leg is not None:
+                for txt in leg.get_texts():
+                    set_min_font(txt, min_sizes["legend"])
+                if leg.get_title() is not None:
+                    set_min_font(leg.get_title(), min_sizes["legend"])
+            for txt in getattr(ax, "texts", []):
+                set_min_font(txt, min_sizes["annotation"])
+            try:
+                ax.tick_params(axis="both", which="major", labelsize=min_sizes["tick"])
+            except Exception:
+                pass
+        return saved
+
+    def _restore_figure_text_after_export(self, saved_fonts):
+        """Restaure les tailles de texte après export."""
+        for text_obj, old_size in saved_fonts:
+            try:
+                text_obj.set_fontsize(old_size)
+            except Exception:
+                pass
+
+    def _save_canvas_for_report(self, canvas, image_path, dpi=240):
+        """Sauvegarde un graphique en haute résolution avec textes lisibles pour Word/PDF."""
+        fig = canvas.fig
+        original_size = fig.get_size_inches().copy()
+        original_dpi = fig.dpi
+        saved_fonts = []
+        try:
+            n_axes = len(getattr(fig, "axes", []))
+            # Format plus grand que l'affichage écran : améliore la lisibilité dans Word.
+            if n_axes >= 4:
+                fig.set_size_inches(12.0, 8.5, forward=False)
+            elif n_axes >= 2:
+                fig.set_size_inches(11.5, 7.5, forward=False)
+            else:
+                fig.set_size_inches(10.5, 6.5, forward=False)
+            fig.set_dpi(dpi)
+            saved_fonts = self._scale_figure_text_for_export(fig)
+            try:
+                fig.tight_layout(pad=1.2)
+            except Exception:
+                pass
+            fig.savefig(image_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+        finally:
+            self._restore_figure_text_after_export(saved_fonts)
+            try:
+                fig.set_size_inches(original_size, forward=False)
+                fig.set_dpi(original_dpi)
+                if hasattr(canvas, "draw_idle"):
+                    canvas.draw_idle()
+            except Exception:
+                pass
+
     def _export_full_report(self):
         self._refresh_report_panel()
         filepath, _ = QFileDialog.getSaveFileName(self, "Exporter rapport complet", "rapport_statpro.pdf", "PDF (*.pdf);;DOCX (*.docx)")
@@ -4099,19 +4111,32 @@ class StatisticalApp(QMainWindow):
             images = {}
             for title, canvas in self._canvas_map().items():
                 if canvas is not None and canvas.fig is not None and canvas.fig.axes:
-                    img = os.path.join(tmpdir, title.replace("/", "_").replace(" ", "_") + ".png")
-                    canvas.fig.savefig(img, dpi=150, bbox_inches="tight")
+                    safe_title = title.replace("/", "_").replace(" ", "_").replace("&", "et")
+                    img = os.path.join(tmpdir, safe_title + ".png")
+                    self._save_canvas_for_report(canvas, img, dpi=240)
                     images[title] = img
             if ext == ".docx":
                 from docx import Document
+                from docx.shared import Inches, Pt
                 doc = Document()
+                # Marges réduites pour laisser plus de largeur aux graphiques.
+                for section in doc.sections:
+                    section.top_margin = Inches(0.55)
+                    section.bottom_margin = Inches(0.55)
+                    section.left_margin = Inches(0.55)
+                    section.right_margin = Inches(0.55)
+                styles = doc.styles
+                styles["Normal"].font.size = Pt(10)
+                styles["Heading 1"].font.size = Pt(15)
                 doc.add_heading("Rapport d'analyse StatPro", 0)
                 doc.add_paragraph(f"Date : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
                 for title, content in sections:
                     doc.add_heading(title, level=1)
                     doc.add_paragraph(content)
                     if title in images:
-                        doc.add_picture(images[title])
+                        doc.add_paragraph("Graphique associé :")
+                        # Largeur adaptée à une page A4/Letter avec marges réduites.
+                        doc.add_picture(images[title], width=Inches(7.1))
                 doc.save(filepath)
             else:
                 from reportlab.lib.pagesizes import A4
@@ -4124,13 +4149,14 @@ class StatisticalApp(QMainWindow):
                     story.append(Paragraph("<br/>".join(content.replace("&", "&amp;").replace("<", "&lt;").splitlines()), styles["Code"]))
                     if title in images:
                         story.append(Spacer(1, 8))
-                        story.append(Image(images[title], width=500, height=300, kind="proportional"))
+                        story.append(Image(images[title], width=520, height=360, kind="proportional"))
                     story.append(PageBreak())
                 SimpleDocTemplate(filepath, pagesize=A4).build(story)
             shutil.rmtree(tmpdir, ignore_errors=True)
             self.status_bar.showMessage(f"Rapport complet exporté : {filepath}")
         except Exception as e:
             QMessageBox.critical(self, "Erreur", f"Impossible d'exporter le rapport :\n{e}")
+
 
     def _export_excel_workbook(self):
         filepath, _ = QFileDialog.getSaveFileName(self, "Exporter Excel multi-feuilles", "statpro_resultats.xlsx", "Excel (*.xlsx)")
