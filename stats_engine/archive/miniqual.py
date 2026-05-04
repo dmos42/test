@@ -47,27 +47,23 @@ def read_table(path, sheet_name=0):
 
 
 def numeric_series(df, col):
-    """Extrait une série numérique finie d'une colonne, en ignorant NaN et Inf."""
+    """Extrait une série numérique d'une colonne, en ignorant les NaN."""
     if col not in df.columns:
         raise KeyError(f'Colonne introuvable: {col}. Colonnes: {list(df.columns)}')
-    s = pd.to_numeric(df[col], errors='coerce')
-    s = s[np.isfinite(s)]
+    s = pd.to_numeric(df[col], errors='coerce').dropna()
     if s.empty:
-        raise ValueError('Aucune valeur numérique finie exploitable')
+        raise ValueError('Aucune valeur numérique exploitable')
     return s
 
 
 def descriptive(s):
-    """Statistiques descriptives d'une série numérique finie."""
-    s = pd.to_numeric(s, errors='coerce')
-    s = s[np.isfinite(s)]
-    if s.empty:
-        raise ValueError('Aucune valeur numérique finie exploitable')
+    """Statistiques descriptives d'une série."""
+    s = pd.to_numeric(s, errors='coerce').dropna()
     return {
         'n': len(s),
         'moyenne': float(s.mean()),
         'mediane': float(s.median()),
-        'ecart_type_echantillon': float(s.std(ddof=1)) if len(s) > 1 else None,
+        'ecart_type_echantillon': float(s.std(ddof=1)),
         'minimum': float(s.min()),
         'q1': float(s.quantile(0.25)),
         'q3': float(s.quantile(0.75)),
@@ -273,53 +269,12 @@ def status(rows):
 
 
 def capability(s, lsl=None, usl=None, target=None, subgroup=None):
-    """Calcule les indices de capabilité (Cp, Cpk, Pp, Ppk, etc.) de manière robuste."""
-    x = pd.to_numeric(pd.Series(s), errors='coerce')
-    x = x[np.isfinite(x)]
-    if len(x) < 2:
-        raise ValueError('Au moins 2 valeurs numériques finies sont nécessaires')
+    """Calcule les indices de capabilité (Cp, Cpk, Pp, Ppk, etc.)."""
+    x = pd.Series(s).dropna().astype(float)
     m = float(x.mean())
     so = float(x.std(ddof=1))
     mr = x.diff().abs().dropna()
     sw = float(mr.mean() / 1.128) if len(mr) and mr.mean() > 0 else so
-    if lsl is None and usl is None:
-        raise ValueError('Renseigner LSL ou USL')
-    if lsl is not None and usl is not None and usl <= lsl:
-        raise ValueError('USL doit être strictement supérieure à LSL')
-    if lsl is not None and usl is not None and target is None:
-        target = (lsl + usl) / 2
-    cu = (usl - m) / (3 * sw) if usl is not None and sw and sw > 0 else None
-    cl = (m - lsl) / (3 * sw) if lsl is not None and sw and sw > 0 else None
-    pu = (usl - m) / (3 * so) if usl is not None and so and so > 0 else None
-    pl = (m - lsl) / (3 * so) if lsl is not None and so and so > 0 else None
-    cp = (usl - lsl) / (6 * sw) if lsl is not None and usl is not None and sw and sw > 0 else None
-    pp = (usl - lsl) / (6 * so) if lsl is not None and usl is not None and so and so > 0 else None
-    def valid(v):
-        return v is not None and np.isfinite(v)
-    mask = pd.Series(False, index=x.index)
-    if lsl is not None:
-        mask |= x < lsl
-    if usl is not None:
-        mask |= x > usl
-    cpk_candidates = [v for v in [cu, cl] if valid(v)]
-    ppk_candidates = [v for v in [pu, pl] if valid(v)]
-    return {
-        'n': len(x), 'mean': m, 'stdev_within': sw, 'stdev_overall': so,
-        'lsl': lsl, 'usl': usl, 'target': target,
-        'cp': cp, 'cpk': min(cpk_candidates) if cpk_candidates else None,
-        'cpk_upper': cu, 'cpk_lower': cl,
-        'pp': pp, 'ppk': min(ppk_candidates) if ppk_candidates else None,
-        'ppk_upper': pu, 'ppk_lower': pl,
-        'ppm_below_lsl': float(scipy_stats.norm.cdf((lsl - m) / so) * 1e6) if lsl is not None and so and so > 0 else None,
-        'ppm_above_usl': float((1 - scipy_stats.norm.cdf((usl - m) / so)) * 1e6) if usl is not None and so and so > 0 else None,
-        'observed_nc_count': int(mask.sum()),
-        'observed_nc_percent': float(mask.mean() * 100),
-        'spec_mode': (
-            'Bilatéral LSL+USL' if lsl is not None and usl is not None
-            else 'Unilatéral supérieur USL' if usl is not None
-            else 'Unilatéral inférieur LSL'
-        ),
-    }
 
     if lsl is None and usl is None:
         raise ValueError('Renseigner LSL ou USL')
@@ -409,49 +364,13 @@ def outlier_tests(s, alpha=0.05, z_threshold=3.0):
 
 
 def normality_tests(s, alpha=0.05):
-    """Tests de normalité sécurisés : Shapiro-Wilk, KS indicatif, Anderson-Darling."""
-    x = pd.to_numeric(pd.Series(s), errors='coerce').to_numpy(dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) < 3:
-        return {
-            'table': [],
-            'favorable_count': 0,
-            'global_ok': False,
-            'error': 'Au moins 3 valeurs numériques finies sont nécessaires pour les tests de normalité.',
-            'n': int(len(x)),
-        }
-    if len(np.unique(x)) <= 1:
-        return {
-            'table': [],
-            'favorable_count': 0,
-            'global_ok': False,
-            'error': 'Données constantes : tests de normalité non applicables.',
-            'n': int(len(x)),
-        }
-    sample = x if len(x) <= 5000 else pd.Series(x).sample(5000, random_state=42).to_numpy()
+    """Tests de normalité : Shapiro-Wilk, Kolmogorov-Smirnov, Anderson-Darling."""
+    x = pd.Series(s).dropna().astype(float).to_numpy()
+    sample = x if len(x) <= 5000 else pd.Series(x).sample(5000, random_state=42)
     sh, shp = scipy_stats.shapiro(sample)
-    sd = np.std(x, ddof=1)
-    if sd > 0:
-        ks, ksp = scipy_stats.kstest(x, 'norm', args=(np.mean(x), sd))
-    else:
-        ks, ksp = np.nan, np.nan
+    ks, ksp = scipy_stats.kstest(x, 'norm', args=(np.mean(x), np.std(x, ddof=1)))
     ad = scipy_stats.anderson(x, 'norm')
     crit = float(ad.critical_values[2])
-    ok = [
-        shp > alpha,
-        ksp > alpha if np.isfinite(ksp) else False,
-        float(ad.statistic) < crit,
-    ]
-    return {
-        'table': [
-            {'Test': 'Shapiro-Wilk', 'Statistique': float(sh), 'p-value / seuil': float(shp), 'Lecture': 'Compatible avec une loi normale' if ok[0] else 'Écart possible à la normalité'},
-            {'Test': 'Kolmogorov-Smirnov indicatif', 'Statistique': float(ks) if np.isfinite(ks) else np.nan, 'p-value / seuil': float(ksp) if np.isfinite(ksp) else np.nan, 'Lecture': 'Compatible avec une loi normale' if ok[1] else 'Écart possible à la normalité'},
-            {'Test': 'Anderson-Darling', 'Statistique': float(ad.statistic), 'p-value / seuil': f'Critique 5% : {crit:.6g}', 'Lecture': 'Compatible avec une loi normale' if ok[2] else 'Écart possible à la normalité'},
-        ],
-        'favorable_count': int(sum(ok)),
-        'global_ok': sum(ok) >= 2,
-        'n': int(len(x)),
-    }
 
     ok = [
         shp > alpha,

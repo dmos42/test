@@ -221,10 +221,8 @@ class DataSheet(QTableWidget):
         self._restore_cells(self._redo_stack.pop())
 
     def _clear_cells(self):
-        selected = self.selectedIndexes()
-        if not selected:
-            return
         self._push_undo()
+        selected = self.selectedIndexes()
         for idx in selected:
             self.setItem(idx.row(), idx.column(), None)
 
@@ -337,8 +335,6 @@ class DataSheet(QTableWidget):
             self._undo()
         elif event.matches(QKeySequence.Redo):
             self._redo()
-        elif event.key() == Qt.Key_Delete:
-            self._clear_cells()
         else:
             super().keyPressEvent(event)
 
@@ -1042,8 +1038,7 @@ class StatisticalApp(QMainWindow):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         refresh_btn = QPushButton(" Actualiser stats")
         refresh_btn.clicked.connect(self._update_data_display)
-        clear_btn = QPushButton(" Effacer tableau")
-        clear_btn.setToolTip("Efface toutes les cellules du tableau de données")
+        clear_btn = QPushButton(" Effacer feuille")
         clear_btn.clicked.connect(self._clear_sheet)
         gen_btn = QPushButton(" Générer données")
         gen_btn.clicked.connect(self._generate_sample_data)
@@ -5177,7 +5172,7 @@ class StatisticalApp(QMainWindow):
 
         analysis_group = QGroupBox("Analyser un plan existant")
         analysis_layout = QFormLayout(analysis_group)
-        self.doe_model = QComboBox(); self.doe_model.addItems(["main", "2fi", "quadratic"]); self.doe_model.setCurrentText("main")
+        self.doe_model = QComboBox(); self.doe_model.addItems(["main", "2fi", "quadratic"]); self.doe_model.setCurrentText("2fi")
         analysis_layout.addRow("Modèle :", self.doe_model)
         self.doe_alpha = QDoubleSpinBox(); self.doe_alpha.setRange(0.001, 0.5); self.doe_alpha.setValue(0.05); self.doe_alpha.setSingleStep(0.005)
         analysis_layout.addRow("Seuil alpha :", self.doe_alpha)
@@ -5220,47 +5215,18 @@ class StatisticalApp(QMainWindow):
         return names[:n]
 
     def _doe_parse_values(self, text_value, n, default):
-        """Lit les niveaux DOE saisis par l'utilisateur.
-
-        Règle importante : dans l'onglet Plan d'expérience, la virgule sert par défaut
-        à séparer les facteurs. Ainsi, pour 2 facteurs, "1,1" signifie [1, 1]
-        et non la valeur décimale 1.1 dupliquée. Pour utiliser des décimales avec
-        virgule française, utiliser le point-virgule entre facteurs, par exemple
-        "1,5;2,5".
-        """
-        raw = (text_value or "").strip()
-        vals = []
-
-        def to_float(token):
-            return float(token.strip().replace(',', '.'))
-
-        if not raw:
+        try:
+            vals = [float(x.strip().replace(',', '.')) for x in text_value.split(';') if x.strip()]
+            if len(vals) == 1 and n > 1:
+                vals = vals * n
+        except Exception:
             vals = []
-        elif ';' in raw:
-            # Le point-virgule permet d'utiliser la virgule comme séparateur décimal.
+        if len(vals) < n:
+            # accepte aussi la séparation par virgule si l'utilisateur n'utilise pas la virgule décimale
             try:
-                vals = [to_float(x) for x in raw.split(';') if x.strip()]
+                vals = [float(x.strip()) for x in text_value.split(',') if x.strip()]
             except Exception:
                 vals = []
-        elif ',' in raw:
-            parts = [x.strip() for x in raw.split(',') if x.strip()]
-            try:
-                if n == 1 and len(parts) == 2 and all(re.fullmatch(r"[-+]?\d+", p) for p in parts):
-                    # Cas particulier mono-facteur : "1,1" reste interprété comme 1.1.
-                    vals = [to_float(raw)]
-                else:
-                    # Cas DOE multi-facteurs : "1,1" -> [1.0, 1.0].
-                    vals = [float(x) for x in parts]
-            except Exception:
-                vals = []
-        else:
-            try:
-                vals = [float(raw)]
-            except Exception:
-                vals = []
-
-        if len(vals) == 1 and n > 1:
-            vals = vals * n
         while len(vals) < n:
             vals.append(default)
         return vals[:n]

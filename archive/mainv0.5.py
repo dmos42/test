@@ -38,10 +38,6 @@ from stats_engine.correlation import CorrelationMatrix
 from stats_engine.probability_plots import ProbabilityPlot
 from stats_engine.msa import GageRRStudy
 from stats_engine.export import ReportExporter
-try:
-    from stats_engine.doe import FullFactorialDOE, TaguchiOA, ResponseSurfaceDOE, DOEAnalyzer
-except ImportError:
-    from doe import FullFactorialDOE, TaguchiOA, ResponseSurfaceDOE, DOEAnalyzer
 
 try:
     # Structure recommandée : stats_engine/miniqual.py
@@ -221,10 +217,8 @@ class DataSheet(QTableWidget):
         self._restore_cells(self._redo_stack.pop())
 
     def _clear_cells(self):
-        selected = self.selectedIndexes()
-        if not selected:
-            return
         self._push_undo()
+        selected = self.selectedIndexes()
         for idx in selected:
             self.setItem(idx.row(), idx.column(), None)
 
@@ -337,8 +331,6 @@ class DataSheet(QTableWidget):
             self._undo()
         elif event.matches(QKeySequence.Redo):
             self._redo()
-        elif event.key() == Qt.Key_Delete:
-            self._clear_cells()
         else:
             super().keyPressEvent(event)
 
@@ -647,7 +639,6 @@ class VerticalNavTabs(QWidget):
         "Capabilité": "Qualité procédé",
         "Cartes de contrôle": "Qualité procédé",
         "MSA / Gage R&R": "Qualité procédé",
-        "Plan d'expérience": "Qualité procédé",
         "Valeurs aberrantes": "Tests statistiques",
         "Test t": "Tests statistiques",
         "ANOVA": "Tests statistiques",
@@ -829,7 +820,6 @@ class StatisticalApp(QMainWindow):
         self.cc_canvas = None
         self.prob_canvas = None
         self.msa_canvas = None
-        self.doe_canvas = None
         
         self._create_central_widget()
 
@@ -940,7 +930,6 @@ class StatisticalApp(QMainWindow):
         self._create_regression_tab()
         self._create_ttest_tab()
         self._create_anova_tab()
-        self._create_doe_tab()
         self._create_boxplot_tab()
         self._create_control_charts_tab()
         self._create_probplot_tab()
@@ -959,8 +948,6 @@ class StatisticalApp(QMainWindow):
             self._update_boxplot_combos()
         elif self.tabs.tabText(index) == "Corrélation" and hasattr(self, "corr_combo_layout"):
             self._update_correlation_combos()
-        elif self.tabs.tabText(index) == "Plan d'expérience" and hasattr(self, "doe_factor_combo_layout"):
-            self._update_doe_factor_combos()
 
     def _refresh_all_combos(self):
         combos = []
@@ -971,7 +958,7 @@ class StatisticalApp(QMainWindow):
                 if attr.endswith("_col_combo") or attr in (
                     "reg_y_combo", "reg_x_combo", "tt_col1_combo", "tt_col2_combo",
                     "msa_part_combo", "msa_op_combo", "msa_meas_combo", "cc_col_combo",
-                    "prob_col_combo", "corr_col_combo", "doe_response_combo",
+                    "prob_col_combo", "corr_col_combo",
                 ):
                     combos.append(obj)
 
@@ -1042,8 +1029,7 @@ class StatisticalApp(QMainWindow):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         refresh_btn = QPushButton(" Actualiser stats")
         refresh_btn.clicked.connect(self._update_data_display)
-        clear_btn = QPushButton(" Effacer tableau")
-        clear_btn.setToolTip("Efface toutes les cellules du tableau de données")
+        clear_btn = QPushButton(" Effacer feuille")
         clear_btn.clicked.connect(self._clear_sheet)
         gen_btn = QPushButton(" Générer données")
         gen_btn.clicked.connect(self._generate_sample_data)
@@ -4717,7 +4703,6 @@ class StatisticalApp(QMainWindow):
                                ("ANOVA", self.anova_result_text), ("CORRÉLATION", self.corr_result_text),
                                ("BOXPLOTS", self.boxplot_result_text),
                                ("MSA / GAGE R&R", self.msa_result_text),
-            ("DOE / PLAN D'EXPÉRIENCE", self.doe_result_text),
                                ("IDENTIFICATION DISTRIBUTION", self.dist_result_text)]:
             if widget.toPlainText().strip():
                 texts.append((title, widget.toPlainText()))
@@ -5136,339 +5121,6 @@ class StatisticalApp(QMainWindow):
         except Exception as e:
             import traceback; self._miniqual_log("=== ERREUR MINIQUAL ==="); self._miniqual_log(traceback.format_exc()); self._show_exception("MiniQual", e, "Impossible de générer le rapport DOCX")
 
-
-    # ===== DOE / PLANS D'EXPÉRIENCES =====
-    def _create_doe_tab(self):
-        tab = QWidget()
-        self.tabs.addTab(tab, "Plan d'expérience")
-        left, left_layout, right, self.doe_canvas = self._setup_analysis_layout(tab)
-
-        info = QLabel("DOE : génération de plans, analyse des effets, ANOVA du modèle et graphiques associés.")
-        info.setStyleSheet("background-color: #eaf4ff; padding: 5px; border: 1px solid #9cc7ed;")
-        left_layout.addWidget(info)
-
-        gen_group = QGroupBox("Créer un plan")
-        gen_layout = QFormLayout(gen_group)
-        self.doe_design_type = QComboBox()
-        self.doe_design_type.addItems(["Factoriel complet", "Taguchi", "Surface de réponse - CCD", "Surface de réponse - Box-Behnken"])
-        gen_layout.addRow("Type de plan :", self.doe_design_type)
-        self.doe_n_factors = QSpinBox(); self.doe_n_factors.setRange(2, 15); self.doe_n_factors.setValue(3)
-        gen_layout.addRow("Nombre de facteurs :", self.doe_n_factors)
-        self.doe_n_levels = QSpinBox(); self.doe_n_levels.setRange(2, 5); self.doe_n_levels.setValue(2)
-        gen_layout.addRow("Niveaux Taguchi / factoriel :", self.doe_n_levels)
-        self.doe_factor_names = QLineEdit("A,B,C")
-        self.doe_factor_names.setToolTip("Noms séparés par des virgules. Exemple : Température,Pression,Vitesse")
-        gen_layout.addRow("Noms facteurs :", self.doe_factor_names)
-        self.doe_low_values = QLineEdit("-1,-1,-1")
-        self.doe_high_values = QLineEdit("1,1,1")
-        gen_layout.addRow("Niveaux bas :", self.doe_low_values)
-        gen_layout.addRow("Niveaux hauts :", self.doe_high_values)
-        self.doe_replicates = QSpinBox(); self.doe_replicates.setRange(1, 20); self.doe_replicates.setValue(1)
-        gen_layout.addRow("Répétitions :", self.doe_replicates)
-        self.doe_center_points = QSpinBox(); self.doe_center_points.setRange(0, 30); self.doe_center_points.setValue(4)
-        gen_layout.addRow("Points centre RSM :", self.doe_center_points)
-        self.doe_randomize = QCheckBox("Randomiser l'ordre des essais")
-        self.doe_randomize.setChecked(True)
-        gen_layout.addRow(self.doe_randomize)
-        gen_btn = QPushButton(" Générer le plan dans la feuille")
-        gen_btn.clicked.connect(self._doe_generate_design)
-        gen_layout.addRow(gen_btn)
-        left_layout.addWidget(gen_group)
-
-        analysis_group = QGroupBox("Analyser un plan existant")
-        analysis_layout = QFormLayout(analysis_group)
-        self.doe_model = QComboBox(); self.doe_model.addItems(["main", "2fi", "quadratic"]); self.doe_model.setCurrentText("main")
-        analysis_layout.addRow("Modèle :", self.doe_model)
-        self.doe_alpha = QDoubleSpinBox(); self.doe_alpha.setRange(0.001, 0.5); self.doe_alpha.setValue(0.05); self.doe_alpha.setSingleStep(0.005)
-        analysis_layout.addRow("Seuil alpha :", self.doe_alpha)
-        self.doe_analyze_n_factors = QSpinBox(); self.doe_analyze_n_factors.setRange(1, 15); self.doe_analyze_n_factors.setValue(3)
-        analysis_layout.addRow("Facteurs à analyser :", self.doe_analyze_n_factors)
-        self.doe_factor_combo_container = QWidget()
-        self.doe_factor_combo_layout = QVBoxLayout(self.doe_factor_combo_container)
-        self.doe_factor_combo_layout.setContentsMargins(0, 0, 0, 0)
-        analysis_layout.addRow(self.doe_factor_combo_container)
-        self.doe_response_combo = QComboBox(); self.doe_response_combo.setMinimumWidth(120)
-        analysis_layout.addRow("Réponse Y :", self.doe_response_combo)
-        refresh_btn = QPushButton("↻ Actualiser les colonnes")
-        refresh_btn.clicked.connect(lambda: (self._refresh_all_combos(), self._update_doe_factor_combos()))
-        analysis_layout.addRow(refresh_btn)
-        analyze_btn = QPushButton(" Analyser DOE")
-        analyze_btn.setMinimumHeight(38)
-        analyze_btn.setStyleSheet("font-weight: bold; font-size: 14px;")
-        analyze_btn.clicked.connect(self._run_doe_analysis)
-        analysis_layout.addRow(analyze_btn)
-        left_layout.addWidget(analysis_group)
-
-        self.doe_factor_col_combos = []
-        self.doe_analyze_n_factors.valueChanged.connect(self._update_doe_factor_combos)
-        self._update_doe_factor_combos()
-
-        result_group = QGroupBox("Résultats DOE")
-        result_layout = QVBoxLayout(result_group)
-        self.doe_result_text = QTextEdit()
-        self.doe_result_text.setReadOnly(True)
-        self.doe_result_text.setFont(QFont("Courier", 10))
-        result_layout.addWidget(self.doe_result_text)
-        self._add_copy_button(result_layout, self.doe_result_text)
-        left_layout.addWidget(result_group, 1)
-
-    def _doe_parse_names(self, n):
-        raw = self.doe_factor_names.text().strip()
-        names = [x.strip() for x in raw.split(',') if x.strip()]
-        while len(names) < n:
-            names.append(f"F{len(names)+1}")
-        return names[:n]
-
-    def _doe_parse_values(self, text_value, n, default):
-        """Lit les niveaux DOE saisis par l'utilisateur.
-
-        Règle importante : dans l'onglet Plan d'expérience, la virgule sert par défaut
-        à séparer les facteurs. Ainsi, pour 2 facteurs, "1,1" signifie [1, 1]
-        et non la valeur décimale 1.1 dupliquée. Pour utiliser des décimales avec
-        virgule française, utiliser le point-virgule entre facteurs, par exemple
-        "1,5;2,5".
-        """
-        raw = (text_value or "").strip()
-        vals = []
-
-        def to_float(token):
-            return float(token.strip().replace(',', '.'))
-
-        if not raw:
-            vals = []
-        elif ';' in raw:
-            # Le point-virgule permet d'utiliser la virgule comme séparateur décimal.
-            try:
-                vals = [to_float(x) for x in raw.split(';') if x.strip()]
-            except Exception:
-                vals = []
-        elif ',' in raw:
-            parts = [x.strip() for x in raw.split(',') if x.strip()]
-            try:
-                if n == 1 and len(parts) == 2 and all(re.fullmatch(r"[-+]?\d+", p) for p in parts):
-                    # Cas particulier mono-facteur : "1,1" reste interprété comme 1.1.
-                    vals = [to_float(raw)]
-                else:
-                    # Cas DOE multi-facteurs : "1,1" -> [1.0, 1.0].
-                    vals = [float(x) for x in parts]
-            except Exception:
-                vals = []
-        else:
-            try:
-                vals = [float(raw)]
-            except Exception:
-                vals = []
-
-        if len(vals) == 1 and n > 1:
-            vals = vals * n
-        while len(vals) < n:
-            vals.append(default)
-        return vals[:n]
-
-    def _doe_generate_design(self):
-        try:
-            n = self.doe_n_factors.value()
-            names = self._doe_parse_names(n)
-            design_type = self.doe_design_type.currentText()
-            reps = self.doe_replicates.value()
-            rng_seed = 42
-            if design_type == "Factoriel complet":
-                lows = self._doe_parse_values(self.doe_low_values.text(), n, -1.0)
-                highs = self._doe_parse_values(self.doe_high_values.text(), n, 1.0)
-                n_levels = self.doe_n_levels.value()
-                factors = {}
-                for name, low, high in zip(names, lows, highs):
-                    if n_levels == 2:
-                        factors[name] = [low, high]
-                    else:
-                        factors[name] = list(np.linspace(low, high, n_levels))
-                plan = FullFactorialDOE(factors)
-                if reps > 1:
-                    plan.replicate(reps)
-                if self.doe_randomize.isChecked():
-                    plan.randomize(seed=rng_seed)
-                matrix = plan.get_design_matrix()
-                meta = f"Plan factoriel complet : {len(matrix)} essais, {n} facteurs, {n_levels} niveaux"
-            elif design_type == "Taguchi":
-                tag = TaguchiOA(n, self.doe_n_levels.value())
-                matrix = tag.get_design_matrix()
-                meta = f"Plan Taguchi {tag.design_name} : {len(matrix)} essais, {n} facteurs"
-            elif design_type == "Surface de réponse - CCD":
-                matrix, names, info = ResponseSurfaceDOE.central_composite(names, center_points=self.doe_center_points.value())
-                meta = f"Plan CCD : {len(matrix)} essais, alpha={info['alpha']:.4f}, points centre={info['center_points']}"
-            else:
-                matrix, names, info = ResponseSurfaceDOE.box_behnken(names, center_points=self.doe_center_points.value())
-                meta = f"Plan Box-Behnken : {len(matrix)} essais, points centre={info['center_points']}"
-            if self.doe_randomize.isChecked() and design_type != "Factoriel complet":
-                idx = np.random.default_rng(rng_seed).permutation(len(matrix))
-                matrix = matrix[idx]
-            self._doe_write_design_to_sheet(matrix, names)
-            lines = ["=" * 72, "PLAN D'EXPÉRIENCE GÉNÉRÉ", "=" * 72, meta, "", "Colonnes écrites dans la feuille :"]
-            for i, name in enumerate(names):
-                lines.append(f"{col_letter(i)} = {name}")
-            lines.append(f"{col_letter(len(names))} = Réponse Y à saisir")
-            lines.append("\nSaisir ensuite les réponses expérimentales dans la colonne Y puis cliquer sur 'Analyser DOE'.")
-            self.doe_result_text.setText("\n".join(lines))
-            self._plot_doe_design(matrix, names)
-            self._refresh_all_combos()
-            self._update_doe_factor_combos()
-            self.status_bar.showMessage(meta)
-        except Exception as e:
-            self._show_exception("DOE", e, "Impossible de générer le plan d'expérience :")
-
-    def _doe_write_design_to_sheet(self, matrix, names):
-        self.sheet.clearContents()
-        n_rows, n_cols = matrix.shape
-        for c in range(n_cols):
-            for r in range(min(n_rows, self.sheet.rowCount())):
-                item = QTableWidgetItem(f"{float(matrix[r, c]):.6g}")
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.sheet.setItem(r, c, item)
-        # colonne réponse laissée vide ; place un rappel non numérique sur la première cellule si possible évité pour ne pas perturber combos.
-
-    def _update_doe_factor_combos(self):
-        if not hasattr(self, "doe_factor_combo_layout"):
-            return
-        current = [c.currentText() for c in getattr(self, "doe_factor_col_combos", [])]
-        while self.doe_factor_combo_layout.count():
-            item = self.doe_factor_combo_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            elif item.layout():
-                while item.layout().count():
-                    child = item.layout().takeAt(0)
-                    if child.widget():
-                        child.widget().deleteLater()
-        cols = []
-        if hasattr(self, "sheet"):
-            for i in range(self.sheet.columnCount()):
-                data = self.sheet.get_column_data(i)
-                if data is not None and len(data) > 0:
-                    cols.append(col_letter(i))
-        if not cols:
-            cols = ["(aucune donnée)"]
-        self.doe_factor_col_combos = []
-        n = self.doe_analyze_n_factors.value() if hasattr(self, "doe_analyze_n_factors") else 2
-        for i in range(n):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(f"Facteur {i+1} :"))
-            combo = QComboBox(); combo.addItems(cols); combo.setMinimumWidth(90)
-            if i < len(current) and current[i] in cols:
-                combo.setCurrentText(current[i])
-            elif i < len(cols) and cols[0] != "(aucune donnée)":
-                combo.setCurrentText(cols[i % len(cols)])
-            row.addWidget(combo); row.addStretch()
-            self.doe_factor_combo_layout.addLayout(row)
-            self.doe_factor_col_combos.append(combo)
-
-    def _run_doe_analysis(self):
-        try:
-            if not getattr(self, "doe_factor_col_combos", None):
-                QMessageBox.warning(self, "DOE", "Sélectionnez les colonnes facteurs.")
-                return
-            factor_arrays, factor_labels = [], []
-            for combo in self.doe_factor_col_combos:
-                data, label = self._get_combo_data(combo)
-                if data is not None and label is not None:
-                    factor_arrays.append(np.asarray(data, dtype=float))
-                    factor_labels.append(label)
-            y, y_label = self._get_combo_data(self.doe_response_combo)
-            if len(factor_arrays) < 1 or y is None:
-                QMessageBox.warning(self, "DOE", "Sélectionnez au moins un facteur et une réponse Y.")
-                return
-            if y_label in factor_labels:
-                QMessageBox.warning(self, "DOE", "La colonne réponse doit être différente des colonnes facteurs.")
-                return
-            min_len = min([len(y)] + [len(x) for x in factor_arrays])
-            if min_len < 3:
-                QMessageBox.warning(self, "DOE", "Au moins 3 essais valides sont nécessaires.")
-                return
-            X = np.column_stack([x[:min_len] for x in factor_arrays])
-            y = np.asarray(y[:min_len], dtype=float)
-            valid = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
-            X, y = X[valid], y[valid]
-            if len(y) < 3:
-                QMessageBox.warning(self, "DOE", "Moins de 3 essais valides après exclusion NaN/Inf.")
-                return
-            analysis = DOEAnalyzer(X, y, factor_names=factor_labels, model=self.doe_model.currentText(), alpha=self.doe_alpha.value())
-            results = analysis.get_results()
-            report = analysis.get_summary()
-            self.doe_result_text.setText(report)
-            self._plot_doe_analysis(results)
-            self.status_bar.showMessage(f"Analyse DOE terminée : {len(y)} essais, {len(factor_labels)} facteur(s)")
-            self._refresh_report_panel()
-        except Exception as e:
-            self._show_exception("DOE", e, "Erreur lors de l'analyse DOE :")
-
-    def _plot_doe_design(self, matrix, names):
-        self.doe_canvas.fig.clear()
-        ax = self.doe_canvas.fig.add_subplot(111)
-        arr = np.asarray(matrix, dtype=float)
-        im = ax.imshow(arr, aspect="auto", interpolation="nearest")
-        ax.set_title("Matrice du plan d'expérience")
-        ax.set_xlabel("Facteurs")
-        ax.set_ylabel("Essais")
-        ax.set_xticks(range(len(names)))
-        ax.set_xticklabels(names, rotation=30, ha="right")
-        self.doe_canvas.fig.colorbar(im, ax=ax, label="Niveau")
-        self.doe_canvas.fig.tight_layout()
-        self.doe_canvas.draw()
-
-    def _plot_doe_analysis(self, results):
-        self.doe_canvas.fig.clear()
-        if not results.get("is_valid", False):
-            ax = self.doe_canvas.fig.add_subplot(111)
-            ax.text(0.5, 0.5, "Analyse DOE non valide", ha="center", va="center")
-            self.doe_canvas.draw()
-            return
-        self.doe_canvas.fig.set_size_inches(14, 9)
-        ax1 = self.doe_canvas.fig.add_subplot(221)
-        ax2 = self.doe_canvas.fig.add_subplot(222)
-        ax3 = self.doe_canvas.fig.add_subplot(223)
-        ax4 = self.doe_canvas.fig.add_subplot(224)
-
-        effects = results.get("effects_sorted", [])[:12]
-        labels = [e["term"] for e in effects][::-1]
-        vals = [e.get("abs_standardized_effect") or 0 for e in effects][::-1]
-        if vals:
-            ax1.barh(labels, vals)
-            if results.get("df_error", 0) > 0:
-                crit = scipy_stats.t.ppf(1 - self.doe_alpha.value()/2, results["df_error"])
-                ax1.axvline(crit, color="red", linestyle="--", label=f"t critique={crit:.2f}")
-                ax1.legend(fontsize=8)
-        ax1.set_title("Pareto des effets standardisés")
-        ax1.set_xlabel("|t|")
-        ax1.grid(True, axis="x", alpha=0.25)
-
-        y = np.asarray(results.get("response", []), dtype=float)
-        y_pred = np.asarray(results.get("y_pred", []), dtype=float)
-        resid = np.asarray(results.get("residuals", []), dtype=float)
-        if len(y) and len(y_pred):
-            ax2.scatter(y_pred, y, alpha=0.75)
-            lo, hi = min(y.min(), y_pred.min()), max(y.max(), y_pred.max())
-            ax2.plot([lo, hi], [lo, hi], "r--")
-        ax2.set_title("Valeurs ajustées vs observées")
-        ax2.set_xlabel("Ajusté")
-        ax2.set_ylabel("Observé")
-        ax2.grid(True, alpha=0.25)
-
-        if len(y_pred) and len(resid):
-            ax3.scatter(y_pred, resid, alpha=0.75)
-            ax3.axhline(0, color="red", linestyle="--")
-        ax3.set_title("Résidus vs valeurs ajustées")
-        ax3.set_xlabel("Ajusté")
-        ax3.set_ylabel("Résidu")
-        ax3.grid(True, alpha=0.25)
-
-        try:
-            scipy_stats.probplot(resid, dist="norm", plot=ax4)
-            ax4.set_title("QQ plot des résidus")
-            ax4.grid(True, alpha=0.25)
-        except Exception:
-            ax4.text(0.5, 0.5, "QQ plot indisponible", ha="center", va="center")
-        self.doe_canvas.fig.tight_layout()
-        self.doe_canvas.draw()
-
     def _create_report_tab(self):
         tab = QWidget()
         self.tabs.addTab(tab, "Rapport d'analyse")
@@ -5528,7 +5180,7 @@ class StatisticalApp(QMainWindow):
         if QMessageBox.question(self, "Nouveau projet", "Effacer les données et résultats actuels ?") != QMessageBox.Yes:
             return
         self.sheet.clearContents()
-        for widget_name in ["stats_text", "cap_result_text", "norm_result_text", "out_result_text", "cc_result_text", "prob_result_text", "reg_result_text", "tt_result_text", "anova_result_text", "corr_result_text", "boxplot_result_text", "msa_result_text", "doe_result_text", "dist_result_text", "miniqual_text"]:
+        for widget_name in ["stats_text", "cap_result_text", "norm_result_text", "out_result_text", "cc_result_text", "prob_result_text", "reg_result_text", "tt_result_text", "anova_result_text", "corr_result_text", "boxplot_result_text", "msa_result_text", "dist_result_text", "miniqual_text"]:
             if hasattr(self, widget_name):
                 getattr(self, widget_name).clear()
         self.current_project_path = None
@@ -5571,7 +5223,7 @@ class StatisticalApp(QMainWindow):
         """Collecte les paramètres UI principaux pour les persister dans le projet."""
         params = {"widgets": {}, "combo_lists": {}}
         prefixes = (
-            "cap_", "miniqual_", "anova_", "doe_", "msa_", "cc_", "prob_",
+            "cap_", "miniqual_", "anova_", "msa_", "cc_", "prob_",
             "reg_", "tt_", "corr_", "boxplot_", "dist_", "norm_", "out_",
         )
         for attr in dir(self):
@@ -5871,7 +5523,6 @@ class StatisticalApp(QMainWindow):
             ("Test t", "tt_result_text"), ("ANOVA", "anova_result_text"),
             ("Boxplots", "boxplot_result_text"), ("Cartes de contrôle", "cc_result_text"),
             ("Graphiques probabilité", "prob_result_text"), ("MSA / Gage R&R", "msa_result_text"),
-            ("Plan d'expérience", "doe_result_text"),
         ]
         for title, attr in mapping:
             if hasattr(self, attr):
@@ -5880,32 +5531,6 @@ class StatisticalApp(QMainWindow):
                 if txt:
                     sections.append((title, txt))
         return sections
-
-
-    def _canvas_map(self):
-        """Associe les titres de rapport aux graphiques disponibles."""
-        return {
-            "Identification distribution": getattr(self, "dist_canvas", None),
-            "Capabilité": getattr(self, "cap_canvas", None),
-            "Normalité": getattr(self, "norm_canvas", None),
-            "Valeurs aberrantes": getattr(self, "out_canvas", None),
-            "Corrélation": getattr(self, "corr_canvas", None),
-            "Régression": getattr(self, "reg_canvas", None),
-            "Test t": getattr(self, "tt_canvas", None),
-            "ANOVA": getattr(self, "anova_canvas", None),
-            "Plan d'expérience": getattr(self, "doe_canvas", None),
-            "Boxplots": getattr(self, "boxplot_canvas", None),
-            "Cartes de contrôle": getattr(self, "cc_canvas", None),
-            "Graphiques probabilité": getattr(self, "prob_canvas", None),
-            "MSA / Gage R&R": getattr(self, "msa_canvas", None),
-        }
-
-    def _save_canvas_for_report(self, canvas, filepath, dpi=240):
-        """Sauvegarde robuste d'un canvas Matplotlib pour les rapports PDF/DOCX."""
-        if canvas is None or getattr(canvas, "fig", None) is None:
-            return False
-        canvas.fig.savefig(filepath, dpi=dpi, bbox_inches="tight")
-        return True
 
     def _refresh_report_panel(self):
         if not hasattr(self, "report_text"):

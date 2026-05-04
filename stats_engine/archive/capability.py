@@ -58,40 +58,18 @@ class CapabilityAnalysis:
         confidence_level: float = 0.95,
         ppk_method: str = "within",
     ):
-        self._results: Dict[str, Any] = {}
-        self._errors: List[str] = []
-        self._warnings: List[str] = []
-
-        raw_data = np.asarray(data, dtype=float)
-        finite_mask = np.isfinite(raw_data)
-        self.n_input = int(raw_data.size)
-        self.n_removed_non_finite = int(raw_data.size - np.sum(finite_mask))
-        self.data = raw_data[finite_mask]
-        if self.n_removed_non_finite:
-            self._warnings.append(
-                f"{self.n_removed_non_finite} valeur(s) non finie(s) (NaN/Inf) exclue(s) de l'analyse."
-            )
-
-        def _finite_or_none(value, name):
-            if value is None:
-                return None
-            try:
-                v = float(value)
-            except Exception:
-                self._warnings.append(f"{name} non numérique ignoré.")
-                return None
-            if not np.isfinite(v):
-                self._warnings.append(f"{name} non fini ignoré.")
-                return None
-            return v
-
-        self.usl = _finite_or_none(usl, "USL")
-        self.lsl = _finite_or_none(lsl, "LSL")
-        self.target = _finite_or_none(target, "Cible")
+        self.data = np.array(data, dtype=float)
+        self.data = self.data[~np.isnan(self.data)]
+        self.usl = usl
+        self.lsl = lsl
+        self.target = target
         self.subgroup_size = int(subgroup_size) if subgroup_size is not None else 1
         self.estimation_method = estimation_method or "rbar"
         self.confidence_level = float(confidence_level)
         self.ppk_method = ppk_method or "within"
+        self._results: Dict[str, Any] = {}
+        self._errors: List[str] = []
+        self._warnings: List[str] = []
         self._compute()
 
     # ------------------------------------------------------------------
@@ -170,8 +148,6 @@ class CapabilityAnalysis:
 
         self._results = {
             "n": n,
-            "n_input": getattr(self, "n_input", n),
-            "n_removed_non_finite": getattr(self, "n_removed_non_finite", 0),
             "errors": list(self._errors),
             "warnings": list(self._warnings),
             "is_valid": len(self._errors) == 0,

@@ -43,10 +43,6 @@ class GageRRStudy:
         interaction_policy: str = "include",
     ):
         self.raw_data = np.asarray(data, dtype=float)
-        self.n_input = int(self.raw_data.size)
-        self.non_finite_mask = ~np.isfinite(self.raw_data)
-        self.n_removed_non_finite = int(np.sum(self.non_finite_mask))
-        self.non_finite_positions = np.where(self.non_finite_mask.ravel())[0].astype(int).tolist()
         self.n_operators = int(n_operators)
         self.n_parts = int(n_parts)
         self.n_trials = int(n_trials)
@@ -110,12 +106,6 @@ class GageRRStudy:
         if self.raw_data.size == 0:
             self._errors.append("Aucune donnée de mesure fournie.")
             return
-        if getattr(self, "n_removed_non_finite", 0) > 0:
-            self._errors.append(
-                f"Valeurs non finies détectées (NaN/Inf) : {self.n_removed_non_finite}. "
-                "Le plan MSA équilibré exige des mesures numériques finies."
-            )
-            return
 
         if self.raw_data.ndim == 1:
             expected = self.n_operators * self.n_parts * self.n_trials
@@ -145,9 +135,6 @@ class GageRRStudy:
     def _init_error_results(self) -> None:
         self._results = {
             "is_valid": False,
-            "n_input": getattr(self, "n_input", int(self.raw_data.size) if hasattr(self, "raw_data") else 0),
-            "n_removed_non_finite": getattr(self, "n_removed_non_finite", 0),
-            "non_finite_positions": getattr(self, "non_finite_positions", []),
             "errors": list(self._errors),
             "warnings": list(self._warnings),
             "n_operators": self.n_operators,
@@ -271,9 +258,6 @@ class GageRRStudy:
 
         self._results = {
             "is_valid": True,
-            "n_input": getattr(self, "n_input", int(self.raw_data.size)),
-            "n_removed_non_finite": getattr(self, "n_removed_non_finite", 0),
-            "non_finite_positions": getattr(self, "non_finite_positions", []),
             "errors": [],
             "warnings": list(self._warnings),
             "alpha": self.alpha,
@@ -417,146 +401,66 @@ class GageRRStudy:
         }
 
     def get_summary(self) -> str:
-        """Résumé court, factuel et lisible de l'étude Gage R&R."""
         r = self._results
+        lines = ["=" * 60, "ÉTUDE GAGE R&R", "=" * 60]
         if not r.get("is_valid", False):
-            lines = ["=" * 60, "ÉTUDE GAGE R&R - Synthèse", "=" * 60, "", "Statut : étude non valide"]
+            lines.append("\nAnalyse non valide :")
             for err in r.get("errors", []):
-                lines.append(f"- {err}")
-            for warn in r.get("warnings", []):
-                lines.append(f"- {warn}")
+                lines.append(f" - {err}")
             return "\n".join(lines)
 
-        def fmt(value, digits=2, suffix=""):
-            if value is None:
-                return "n/a"
-            try:
-                if not np.isfinite(value):
-                    return "n/a"
-                return f"{float(value):.{digits}f}{suffix}"
-            except Exception:
-                return "n/a"
-
-        def pval(value):
-            if value is None:
-                return "n/a"
-            try:
-                if not np.isfinite(value):
-                    return "n/a"
-                return "< 0.000001" if value < 0.000001 else f"= {value:.6f}"
-            except Exception:
-                return "n/a"
-
-        def status_pct(value):
-            if value is None:
-                return "non calculable"
-            if value < 10:
-                return "favorable"
-            if value <= 30:
-                return "intermédiaire"
-            return "défavorable"
-
-        def status_ndc(value):
-            if value is None:
-                return "non calculable"
-            return "favorable" if value >= 5 else "défavorable"
-
-        sigma_grr = r.get("sigma_gage_rr")
-        six_sigma_grr = 6.0 * sigma_grr if sigma_grr is not None and np.isfinite(sigma_grr) else None
-        pct_contrib_grr = r.get("pct_contribution_gage_rr")
-        pct_contrib_part = r.get("pct_contribution_part")
-        pct_sv_grr = r.get("pct_study_variation_gage_rr")
-        pct_tol = r.get("pct_tolerance")
-        ndc = r.get("ndc")
-
-        lines = ["=" * 60, "ÉTUDE GAGE R&R - Synthèse", "=" * 60]
+        lines.append(f"\nOpérateurs : {r['n_operators']}, Pièces : {r['n_parts']}, Répétitions : {r['n_trials']}")
+        lines.append(f"Politique interaction : {r['interaction_policy']} | Interaction incluse : {r['interaction_included']}")
         if r.get("warnings"):
-            lines.append("\nMessages :")
-            lines.extend(f"- {w}" for w in r.get("warnings", []))
+            lines.append("\nAvertissements :")
+            for w in r["warnings"]:
+                lines.append(f" - {w}")
 
-        lines += [
-            "\nPlan d’étude :",
-            f"{r.get('n_operators')} opérateurs × {r.get('n_parts')} pièces × {r.get('n_trials')} répétitions",
-            f"Nombre total de mesures = {r.get('n_total')}",
-            f"Interaction opérateur × pièce : {'incluse' if r.get('interaction_included') else 'non incluse'}",
-            "\nRésultats principaux :",
-            f"% Contribution Gage R&R = {fmt(pct_contrib_grr, 2, ' %')}",
-            f"% Study Variation Gage R&R = {fmt(pct_sv_grr, 2, ' %')}",
-            f"% Tolérance Gage R&R = {fmt(pct_tol, 2, ' %')}",
-            f"ndc = {fmt(ndc, 0)}",
-            "\nLecture des critères :",
-            f"% Contribution : {status_pct(pct_contrib_grr)}",
-            f"% Study Variation : {status_pct(pct_sv_grr)}",
-            f"% Tolérance : {status_pct(pct_tol)}",
-            f"ndc : {status_ndc(ndc)}",
-            "\nRépartition :",
-            "La variation observée est principalement liée aux pièces." if (pct_contrib_part or 0) >= 50 else "La variation observée n’est pas principalement portée par les pièces.",
-            "La contribution du système de mesure est faible dans cette étude." if (pct_contrib_grr or 999) < 10 else "La contribution du système de mesure est élevée dans cette étude.",
-            f"σ Gage R&R = {fmt(r.get('sigma_gage_rr'), 4)}",
-            f"σ Répétabilité = {fmt(r.get('sigma_repeatability'), 4)}",
-            f"σ Reproductibilité = {fmt(r.get('sigma_reproducibility'), 4)}",
-            f"σ Interaction = {fmt(r.get('sigma_interaction'), 4)}",
-            f"σ Pièce = {fmt(r.get('sigma_part'), 4)}",
-            f"σ Totale = {fmt(r.get('sigma_total'), 4)}",
-            "\nTolérance :",
-            f"6 × σ Gage R&R = {fmt(six_sigma_grr, 4)}",
-            f"Tolérance renseignée = {fmt(r.get('tolerance'), 4)}",
-            f"%Tolérance = {fmt(pct_tol, 2, ' %')}",
-            "\nANOVA :",
-            f"Pièces : p-value {pval(r.get('p_parts'))}",
-            f"Opérateurs : p-value {pval(r.get('p_operators'))}",
-            f"Interaction opérateur × pièce : p-value {pval(r.get('p_interaction'))}",
-            "\nConclusion :",
-            f"Résultat {status_pct(pct_sv_grr)} selon la variation observée.",
-            f"Résultat {status_pct(pct_tol)} selon la tolérance renseignée.",
-            f"Résultat {status_ndc(ndc)} selon le nombre de catégories distinctes.",
-            "\n" + "=" * 60,
-            "Détails techniques",
-            "=" * 60,
-            "\nANOVA :",
-        ]
-
-        for source, ss, df, ms, f, p in [
-            ("Pièces", "ss_parts", "df_parts", "ms_parts", "f_parts", "p_parts"),
-            ("Opérateurs", "ss_operators", "df_operators", "ms_operators", "f_operators", "p_operators"),
-            ("Interaction opérateur×pièce", "ss_interaction", "df_interaction", "ms_interaction", "f_interaction", "p_interaction"),
-            ("Répétabilité", "ss_repeatability", "df_repeatability", "ms_repeatability", None, None),
-            ("Total", "ss_total", "df_total", None, None, None),
-        ]:
+        lines.append("\n--- ANOVA ---")
+        lines.append("Source | SS | df | MS | F | p-value")
+        for row in r.get("anova_table", []):
             lines.append(
-                f"- {source}: SS={fmt(r.get(ss), 4)}, df={fmt(r.get(df), 0)}, "
-                f"MS={fmt(r.get(ms), 4)}, F={fmt(r.get(f), 4)}, p={pval(r.get(p))}"
+                f"{row['Source']} | {self._fmt(row.get('SS'), 4)} | {row.get('df')} | "
+                f"{self._fmt(row.get('MS'), 4)} | {self._fmt(row.get('F'), 4)} | {self._fmt(row.get('p-value'), 6)}"
             )
 
-        lines.append("\nComposantes de variance :")
-        for label, key in [
-            ("Répétabilité", "sigma_repeatability"),
-            ("Reproductibilité", "sigma_reproducibility"),
-            ("Interaction", "sigma_interaction"),
-            ("Gage R&R", "sigma_gage_rr"),
-            ("Pièce", "sigma_part"),
-            ("Totale", "sigma_total"),
-        ]:
-            lines.append(f"- {label}: σ={fmt(r.get(key), 6)}")
+        lines.append("\n--- Composantes de variance ---")
+        lines.append(f" σ_répétabilité = {self._fmt(r.get('sigma_repeatability'))}")
+        lines.append(f" σ_reproductibilité = {self._fmt(r.get('sigma_reproducibility'))}")
+        lines.append(f" σ_interaction = {self._fmt(r.get('sigma_interaction'))}")
+        lines.append(f" σ_Gage R&R = {self._fmt(r.get('sigma_gage_rr'))}")
+        lines.append(f" σ_Pièce = {self._fmt(r.get('sigma_part'))}")
+        lines.append(f" σ_Totale = {self._fmt(r.get('sigma_total'))}")
 
-        lines.append("\n% Contribution :")
-        for label, key in [
-            ("Répétabilité", "pct_contribution_repeatability"),
-            ("Reproductibilité", "pct_contribution_reproducibility"),
-            ("Interaction", "pct_contribution_interaction"),
-            ("Gage R&R", "pct_contribution_gage_rr"),
-            ("Pièce", "pct_contribution_part"),
-        ]:
-            lines.append(f"- {label}: {fmt(r.get(key), 2, ' %')}")
+        lines.append("\n--- % Contribution ---")
+        lines.append(f" Répétabilité = {self._fmt(r.get('pct_contribution_repeatability'), 2)}%")
+        lines.append(f" Reproductibilité = {self._fmt(r.get('pct_contribution_reproducibility'), 2)}%")
+        lines.append(f" Interaction = {self._fmt(r.get('pct_contribution_interaction'), 2)}%")
+        lines.append(f" Gage R&R = {self._fmt(r.get('pct_contribution_gage_rr'), 2)}%")
+        lines.append(f" Pièce = {self._fmt(r.get('pct_contribution_part'), 2)}%")
 
-        lines.append("\n% Study Variation :")
-        for label, key in [
-            ("Répétabilité", "pct_study_variation_repeatability"),
-            ("Reproductibilité", "pct_study_variation_reproducibility"),
-            ("Interaction", "pct_study_variation_interaction"),
-            ("Gage R&R", "pct_study_variation_gage_rr"),
-            ("Pièce", "pct_study_variation_part"),
-        ]:
-            lines.append(f"- {label}: {fmt(r.get(key), 2, ' %')}")
+        lines.append("\n--- % Study Variation ---")
+        lines.append(f" Répétabilité = {self._fmt(r.get('pct_study_variation_repeatability'), 2)}%")
+        lines.append(f" Reproductibilité = {self._fmt(r.get('pct_study_variation_reproducibility'), 2)}%")
+        lines.append(f" Interaction = {self._fmt(r.get('pct_study_variation_interaction'), 2)}%")
+        lines.append(f" Gage R&R = {self._fmt(r.get('pct_study_variation_gage_rr'), 2)}%")
+        lines.append(f" Pièce = {self._fmt(r.get('pct_study_variation_part'), 2)}%")
 
+        if r.get("pct_tolerance") is not None:
+            lines.append("\n--- % Tolérance ---")
+            lines.append(f" %Tol Gage R&R = {self._fmt(r.get('pct_tolerance'), 2)}%")
+
+        lines.append("\n--- Nombre de catégories distinctes ---")
+        lines.append(f" ndc = {r.get('ndc')}")
+
+        lines.append("\n--- Conclusion ---")
+        lines.append(f" Critère principal : {r.get('acceptability_metric_name')} = {self._fmt(r.get('acceptability_metric'), 2)}%")
+        lines.append(f" Conclusion : {r.get('acceptability')}")
+        if r.get("acceptability") == "Acceptable":
+            lines.append(" ✓ Système de mesure acceptable")
+        elif r.get("acceptability") == "Conditionnellement acceptable":
+            lines.append(" ⚠ Système de mesure utilisable sous justification / amélioration recommandée")
+        else:
+            lines.append(" ⚠ Système de mesure à améliorer avant utilisation critique")
+        lines.append("=" * 60)
         return "\n".join(lines)

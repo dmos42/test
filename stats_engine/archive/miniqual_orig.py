@@ -9,24 +9,14 @@ import pandas as pd
 from scipy import stats as scipy_stats
 import matplotlib.pyplot as plt
 
-SUPPORTED_DISTRIBUTIONS = [
-    'normal', 'lognormal', 'weibull', 'exponential', 'gamma',
-    'logistic', 'gumbel', 'cauchy', 'rayleigh', 'uniform', 'student_t', 'laplace'
-]
+SUPPORTED_DISTRIBUTIONS = ['normal', 'lognormal', 'weibull', 'gamma', 'exponential']
 
 LABEL = {
     'normal': 'normale',
     'lognormal': 'lognormale',
     'weibull': 'Weibull',
-    'exponential': 'exponentielle 2P',
     'gamma': 'gamma',
-    'logistic': 'logistique',
-    'gumbel': 'Gumbel max',
-    'cauchy': 'Cauchy',
-    'rayleigh': 'Rayleigh',
-    'uniform': 'uniforme',
-    'student_t': 'Student-t',
-    'laplace': 'Laplace',
+    'exponential': 'exponentielle',
 }
 
 
@@ -47,27 +37,23 @@ def read_table(path, sheet_name=0):
 
 
 def numeric_series(df, col):
-    """Extrait une série numérique finie d'une colonne, en ignorant NaN et Inf."""
+    """Extrait une série numérique d'une colonne, en ignorant les NaN."""
     if col not in df.columns:
         raise KeyError(f'Colonne introuvable: {col}. Colonnes: {list(df.columns)}')
-    s = pd.to_numeric(df[col], errors='coerce')
-    s = s[np.isfinite(s)]
+    s = pd.to_numeric(df[col], errors='coerce').dropna()
     if s.empty:
-        raise ValueError('Aucune valeur numérique finie exploitable')
+        raise ValueError('Aucune valeur numérique exploitable')
     return s
 
 
 def descriptive(s):
-    """Statistiques descriptives d'une série numérique finie."""
-    s = pd.to_numeric(s, errors='coerce')
-    s = s[np.isfinite(s)]
-    if s.empty:
-        raise ValueError('Aucune valeur numérique finie exploitable')
+    """Statistiques descriptives d'une série."""
+    s = pd.to_numeric(s, errors='coerce').dropna()
     return {
         'n': len(s),
         'moyenne': float(s.mean()),
         'mediane': float(s.median()),
-        'ecart_type_echantillon': float(s.std(ddof=1)) if len(s) > 1 else None,
+        'ecart_type_echantillon': float(s.std(ddof=1)),
         'minimum': float(s.min()),
         'q1': float(s.quantile(0.25)),
         'q3': float(s.quantile(0.75)),
@@ -76,13 +62,13 @@ def descriptive(s):
 
 
 def _pos(x, d):
-    """Filtre les valeurs selon le support de la distribution."""
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if d in ['lognormal', 'weibull', 'gamma', 'rayleigh']:
+    """Filtre les valeurs positives selon la distribution."""
+    if d in ['lognormal', 'weibull', 'gamma']:
         return x[x > 0]
-    # Exponentielle 2P : loc libre, les valeurs négatives sont possibles si le procédé est décalé.
+    if d == 'exponential':
+        return x[x >= 0]
     return x
+
 
 def _dist(d):
     """Retourne l'objet scipy.stats pour une distribution."""
@@ -90,16 +76,10 @@ def _dist(d):
         'normal': scipy_stats.norm,
         'lognormal': scipy_stats.lognorm,
         'weibull': scipy_stats.weibull_min,
-        'exponential': scipy_stats.expon,
         'gamma': scipy_stats.gamma,
-        'logistic': scipy_stats.logistic,
-        'gumbel': scipy_stats.gumbel_r,
-        'cauchy': scipy_stats.cauchy,
-        'rayleigh': scipy_stats.rayleigh,
-        'uniform': scipy_stats.uniform,
-        'student_t': scipy_stats.t,
-        'laplace': scipy_stats.laplace,
+        'exponential': scipy_stats.expon,
     }[d]
+
 
 def _name(d):
     """Nom scipy pour le test KS."""
@@ -107,16 +87,10 @@ def _name(d):
         'normal': 'norm',
         'lognormal': 'lognorm',
         'weibull': 'weibull_min',
-        'exponential': 'expon',
         'gamma': 'gamma',
-        'logistic': 'logistic',
-        'gumbel': 'gumbel_r',
-        'cauchy': 'cauchy',
-        'rayleigh': 'rayleigh',
-        'uniform': 'uniform',
-        'student_t': 't',
-        'laplace': 'laplace',
+        'exponential': 'expon',
     }[d]
+
 
 def fit_distribution(series, d):
     """Ajuste une distribution aux données et retourne les résultats du test KS."""
@@ -130,30 +104,19 @@ def fit_distribution(series, d):
             'paramètres': 'Données incompatibles',
             'params': None,
         }
-    try:
-        if d == 'normal':
-            params = scipy_stats.norm.fit(xp)
-        elif d in ['lognormal', 'weibull', 'gamma', 'rayleigh']:
-            params = _dist(d).fit(xp, floc=0)
-        else:
-            # Exponentielle 2P, logistique, Gumbel, Cauchy, uniforme, Student-t, Laplace : loc libre.
-            params = _dist(d).fit(xp)
-        D, p = scipy_stats.kstest(xp, _name(d), args=params)
-        return {
-            'loi': d,
-            'p_value': float(p),
-            'statistique': float(D),
-            'paramètres': str(tuple(round(float(v), 6) for v in params)),
-            'params': params,
-        }
-    except Exception as e:
-        return {
-            'loi': d,
-            'p_value': np.nan,
-            'statistique': np.nan,
-            'paramètres': f'Erreur : {e}',
-            'params': None,
-        }
+    if d == 'normal':
+        params = scipy_stats.norm.fit(xp)
+    else:
+        params = _dist(d).fit(xp) if d == 'exponential' else _dist(d).fit(xp, floc=0)
+    D, p = scipy_stats.kstest(xp, _name(d), args=params)
+    return {
+        'loi': d,
+        'p_value': float(p),
+        'statistique': float(D),
+        'paramètres': str(tuple(round(float(v), 6) for v in params)),
+        'params': params,
+    }
+
 
 def distribution_pvalues(s):
     """Retourne les p-values de toutes les distributions triées (meilleure en premier)."""
@@ -234,11 +197,14 @@ def boxcox_transform(s, lsl=None, usl=None, target=None):
 def validate_capability(df, col, lsl=None, usl=None, target=None, subgroup=None, distribution='normal'):
     """Valide les paramètres avant une analyse de capabilité."""
     rows = []
+
     def add(niveau, message):
         rows.append({'Niveau': niveau, 'Message': message})
+
     if col not in df.columns:
         add('ERREUR', f'Colonne mesure introuvable: {col}')
         return rows
+
     s = pd.to_numeric(df[col], errors='coerce')
     n = s.notna().sum()
     bad = len(df) - n
@@ -259,9 +225,12 @@ def validate_capability(df, col, lsl=None, usl=None, target=None, subgroup=None,
     if subgroup and subgroup not in df.columns:
         add('AVERTISSEMENT', f'Sous-groupe introuvable: {subgroup}. Calcul sans sous-groupe')
     vals = s.dropna()
-    if distribution in ['lognormal', 'weibull', 'gamma', 'rayleigh'] and (vals <= 0).any():
-        add('AVERTISSEMENT', f'Loi {distribution}: des valeurs <=0 sont incompatibles avec le support forcé à 0')
+    if distribution in ['lognormal', 'weibull', 'gamma'] and (vals <= 0).any():
+        add('AVERTISSEMENT', f'Loi {distribution}: des valeurs <=0 sont incompatibles')
+    if distribution == 'exponential' and (vals < 0).any():
+        add('AVERTISSEMENT', 'Loi exponentielle: des valeurs <0 sont incompatibles')
     return rows
+
 
 def status(rows):
     """Retourne le statut global à partir des lignes de validation."""
@@ -273,53 +242,12 @@ def status(rows):
 
 
 def capability(s, lsl=None, usl=None, target=None, subgroup=None):
-    """Calcule les indices de capabilité (Cp, Cpk, Pp, Ppk, etc.) de manière robuste."""
-    x = pd.to_numeric(pd.Series(s), errors='coerce')
-    x = x[np.isfinite(x)]
-    if len(x) < 2:
-        raise ValueError('Au moins 2 valeurs numériques finies sont nécessaires')
+    """Calcule les indices de capabilité (Cp, Cpk, Pp, Ppk, etc.)."""
+    x = pd.Series(s).dropna().astype(float)
     m = float(x.mean())
     so = float(x.std(ddof=1))
     mr = x.diff().abs().dropna()
     sw = float(mr.mean() / 1.128) if len(mr) and mr.mean() > 0 else so
-    if lsl is None and usl is None:
-        raise ValueError('Renseigner LSL ou USL')
-    if lsl is not None and usl is not None and usl <= lsl:
-        raise ValueError('USL doit être strictement supérieure à LSL')
-    if lsl is not None and usl is not None and target is None:
-        target = (lsl + usl) / 2
-    cu = (usl - m) / (3 * sw) if usl is not None and sw and sw > 0 else None
-    cl = (m - lsl) / (3 * sw) if lsl is not None and sw and sw > 0 else None
-    pu = (usl - m) / (3 * so) if usl is not None and so and so > 0 else None
-    pl = (m - lsl) / (3 * so) if lsl is not None and so and so > 0 else None
-    cp = (usl - lsl) / (6 * sw) if lsl is not None and usl is not None and sw and sw > 0 else None
-    pp = (usl - lsl) / (6 * so) if lsl is not None and usl is not None and so and so > 0 else None
-    def valid(v):
-        return v is not None and np.isfinite(v)
-    mask = pd.Series(False, index=x.index)
-    if lsl is not None:
-        mask |= x < lsl
-    if usl is not None:
-        mask |= x > usl
-    cpk_candidates = [v for v in [cu, cl] if valid(v)]
-    ppk_candidates = [v for v in [pu, pl] if valid(v)]
-    return {
-        'n': len(x), 'mean': m, 'stdev_within': sw, 'stdev_overall': so,
-        'lsl': lsl, 'usl': usl, 'target': target,
-        'cp': cp, 'cpk': min(cpk_candidates) if cpk_candidates else None,
-        'cpk_upper': cu, 'cpk_lower': cl,
-        'pp': pp, 'ppk': min(ppk_candidates) if ppk_candidates else None,
-        'ppk_upper': pu, 'ppk_lower': pl,
-        'ppm_below_lsl': float(scipy_stats.norm.cdf((lsl - m) / so) * 1e6) if lsl is not None and so and so > 0 else None,
-        'ppm_above_usl': float((1 - scipy_stats.norm.cdf((usl - m) / so)) * 1e6) if usl is not None and so and so > 0 else None,
-        'observed_nc_count': int(mask.sum()),
-        'observed_nc_percent': float(mask.mean() * 100),
-        'spec_mode': (
-            'Bilatéral LSL+USL' if lsl is not None and usl is not None
-            else 'Unilatéral supérieur USL' if usl is not None
-            else 'Unilatéral inférieur LSL'
-        ),
-    }
 
     if lsl is None and usl is None:
         raise ValueError('Renseigner LSL ou USL')
@@ -409,49 +337,13 @@ def outlier_tests(s, alpha=0.05, z_threshold=3.0):
 
 
 def normality_tests(s, alpha=0.05):
-    """Tests de normalité sécurisés : Shapiro-Wilk, KS indicatif, Anderson-Darling."""
-    x = pd.to_numeric(pd.Series(s), errors='coerce').to_numpy(dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) < 3:
-        return {
-            'table': [],
-            'favorable_count': 0,
-            'global_ok': False,
-            'error': 'Au moins 3 valeurs numériques finies sont nécessaires pour les tests de normalité.',
-            'n': int(len(x)),
-        }
-    if len(np.unique(x)) <= 1:
-        return {
-            'table': [],
-            'favorable_count': 0,
-            'global_ok': False,
-            'error': 'Données constantes : tests de normalité non applicables.',
-            'n': int(len(x)),
-        }
-    sample = x if len(x) <= 5000 else pd.Series(x).sample(5000, random_state=42).to_numpy()
+    """Tests de normalité : Shapiro-Wilk, Kolmogorov-Smirnov, Anderson-Darling."""
+    x = pd.Series(s).dropna().astype(float).to_numpy()
+    sample = x if len(x) <= 5000 else pd.Series(x).sample(5000, random_state=42)
     sh, shp = scipy_stats.shapiro(sample)
-    sd = np.std(x, ddof=1)
-    if sd > 0:
-        ks, ksp = scipy_stats.kstest(x, 'norm', args=(np.mean(x), sd))
-    else:
-        ks, ksp = np.nan, np.nan
+    ks, ksp = scipy_stats.kstest(x, 'norm', args=(np.mean(x), np.std(x, ddof=1)))
     ad = scipy_stats.anderson(x, 'norm')
     crit = float(ad.critical_values[2])
-    ok = [
-        shp > alpha,
-        ksp > alpha if np.isfinite(ksp) else False,
-        float(ad.statistic) < crit,
-    ]
-    return {
-        'table': [
-            {'Test': 'Shapiro-Wilk', 'Statistique': float(sh), 'p-value / seuil': float(shp), 'Lecture': 'Compatible avec une loi normale' if ok[0] else 'Écart possible à la normalité'},
-            {'Test': 'Kolmogorov-Smirnov indicatif', 'Statistique': float(ks) if np.isfinite(ks) else np.nan, 'p-value / seuil': float(ksp) if np.isfinite(ksp) else np.nan, 'Lecture': 'Compatible avec une loi normale' if ok[1] else 'Écart possible à la normalité'},
-            {'Test': 'Anderson-Darling', 'Statistique': float(ad.statistic), 'p-value / seuil': f'Critique 5% : {crit:.6g}', 'Lecture': 'Compatible avec une loi normale' if ok[2] else 'Écart possible à la normalité'},
-        ],
-        'favorable_count': int(sum(ok)),
-        'global_ok': sum(ok) >= 2,
-        'n': int(len(x)),
-    }
 
     ok = [
         shp > alpha,
@@ -485,71 +377,32 @@ def normality_tests(s, alpha=0.05):
     }
 
 
-def nonnormal_capability(s, lsl=None, usl=None, distribution='empirical'):
-    """Capabilité non normale.
-
-    - distribution='empirical' : conserve l'ancien comportement par percentiles empiriques.
-    - autre distribution supportée : percentiles de la loi ajustée + ppm prédits.
-    """
+def nonnormal_capability(s, lsl=None, usl=None):
+    """Capabilité non-normale basée sur les percentiles empiriques."""
     x = pd.Series(s).dropna().astype(float)
-    if distribution in (None, 'empirical'):
-        lo = x.quantile(0.00135)
-        hi = x.quantile(0.99865)
-        med = x.median()
-        out = {
-            'méthode': 'Percentiles empiriques 0,135% / 99,865%',
-            'q0_135': float(lo),
-            'q99_865': float(hi),
-            'mediane': float(med),
-        }
-    else:
-        fit = fit_distribution(x, distribution)
-        p = fit.get('params')
-        if p is None:
-            return {
-                'méthode': f'Percentiles de loi ajustée ({distribution})',
-                'erreur': fit.get('paramètres', 'Paramètres non estimables'),
-            }
-        dist = _dist(distribution)
-        lo = float(dist.ppf(0.00135, *p))
-        med = float(dist.ppf(0.5, *p))
-        hi = float(dist.ppf(0.99865, *p))
-        out = {
-            'méthode': f"Percentiles de loi ajustée ({LABEL.get(distribution, distribution)})",
-            'loi': distribution,
-            'p_value': fit.get('p_value'),
-            'paramètres': fit.get('paramètres'),
-            'q0_135': float(lo),
-            'q99_865': float(hi),
-            'mediane': float(med),
-        }
-        p_below = max(0.0, min(1.0, float(dist.cdf(lsl, *p)))) if lsl is not None else None
-        p_above = max(0.0, 1.0 - max(0.0, min(1.0, float(dist.cdf(usl, *p))))) if usl is not None else None
-        out['prob_below_lsl'] = p_below
-        out['prob_above_usl'] = p_above
-        out['prob_total_oos'] = (p_below or 0.0) + (p_above or 0.0)
-        out['ppm_below_lsl'] = p_below * 1e6 if p_below is not None else None
-        out['ppm_above_usl'] = p_above * 1e6 if p_above is not None else None
-        out['ppm_total_oos'] = out['prob_total_oos'] * 1e6
+    lo = x.quantile(0.00135)
+    hi = x.quantile(0.99865)
+    med = x.median()
 
-    def safe_ratio(num, den):
-        if den is None or abs(float(den)) <= np.finfo(float).eps:
-            return None
-        if not np.isfinite(num) or not np.isfinite(den):
-            return None
-        return float(num) / float(den)
+    out = {
+        'méthode': 'Percentiles empiriques 0,135% / 99,865%',
+        'q0_135': float(lo),
+        'q99_865': float(hi),
+        'mediane': float(med),
+    }
 
     if lsl is not None and usl is not None and hi > lo:
-        out['CNp'] = safe_ratio(usl - lsl, hi - lo)
-        out['pp_non_normal'] = out['CNp']
-    ppl = safe_ratio(med - lsl, med - lo) if lsl is not None else None
-    ppu = safe_ratio(usl - med, hi - med) if usl is not None else None
-    vals = [v for v in (ppl, ppu) if v is not None and np.isfinite(v)]
-    out['ppl_non_normal'] = ppl
-    out['ppu_non_normal'] = ppu
-    out['CNpk'] = min(vals) if vals else None
-    out['ppk_non_normal'] = out['CNpk']
+        out['CNp'] = float((usl - lsl) / (hi - lo))
+        if hi != med and med != lo:
+            out['CNpk'] = float(min(
+                (usl - med) / (hi - med),
+                (med - lsl) / (med - lo),
+            ))
+        else:
+            out['CNpk'] = None
+
     return out
+
 
 def dashboard(s, res, out_png, normality=None, distribution='normal', accept=1.33, excellent=1.67):
     """Génère un dashboard de capabilité en 4 panneaux et le sauve en PNG."""
@@ -594,23 +447,14 @@ def dashboard(s, res, out_png, normality=None, distribution='normal', accept=1.3
         ax[1, 0].plot([lo_min, hi_max], [lo_min, hi_max], 'r-')
     ax[1, 0].set_title(f"Q-Q plot — {LABEL.get(distribution, distribution)}")
 
-    # Barres indices — si la capabilité non normale est disponible, elle est retenue.
-    if res.get('ppk_non_normal') is not None:
-        index_specs = [
-            ('Pp', 'pp_non_normal'),
-            ('Ppl', 'ppl_non_normal'),
-            ('Ppu', 'ppu_non_normal'),
-            ('Ppk', 'ppk_non_normal'),
-        ]
-        chart_title = f"Indices non normaux — {LABEL.get(distribution, distribution)}"
-    else:
-        index_specs = [
-            ('Pp', 'pp'),
-            ('Ppl', 'ppk_lower'),
-            ('Ppu', 'ppk_upper'),
-            ('Ppk', 'ppk'),
-        ]
-        chart_title = 'Indices normaux/classiques'
+    # Barres indices — toujours afficher Cp, Cpk sup., Cpk inf. et Cpk global.
+    # Si un indice n'est pas applicable (ex. Cp avec une seule limite), on affiche N/A.
+    index_specs = [
+        ('Cp', 'cp'),
+        ('Cpk sup.', 'cpk_upper'),
+        ('Cpk inf.', 'cpk_lower'),
+        ('Cpk global', 'cpk'),
+    ]
     labels = [lab for lab, _ in index_specs]
     raw_vals = [res.get(key) for _, key in index_specs]
     vals = [float(v) if v is not None and np.isfinite(v) else 0.0 for v in raw_vals]
@@ -623,11 +467,11 @@ def dashboard(s, res, out_png, normality=None, distribution='normal', accept=1.3
     for bar, raw in zip(bars, raw_vals):
         if raw is None or not np.isfinite(raw):
             ax[1, 1].text(bar.get_x() + bar.get_width() / 2, 0.02, 'N/A',
-                          ha='center', va='bottom', fontsize=9)
+                          ha='center', va='bottom', fontsize=9, rotation=0)
         else:
             ax[1, 1].text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f'{float(raw):.2f}',
                           ha='center', va='bottom', fontsize=9)
-    ax[1, 1].set_title(chart_title)
+    ax[1, 1].set_title('Indices de capabilité')
     ax[1, 1].legend(fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])

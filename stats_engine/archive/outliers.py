@@ -68,13 +68,9 @@ class OutlierDetection:
             if len(raw_indices) != len(raw):
                 raise ValueError("original_indices doit avoir la même longueur que data.")
 
-        finite_mask = np.isfinite(raw)
-        self.n_input = int(raw.size)
-        self.n_removed_non_finite = int(raw.size - np.sum(finite_mask))
-        self.non_finite_original_indices = raw_indices[~finite_mask].astype(int).tolist()
-        self.non_finite_display_rows = (raw_indices[~finite_mask] + int(display_row_offset)).astype(int).tolist()
-        self.data = raw[finite_mask]
-        self.original_indices = raw_indices[finite_mask]
+        valid_mask = ~np.isnan(raw)
+        self.data = raw[valid_mask]
+        self.original_indices = raw_indices[valid_mask]
         self.display_rows = self.original_indices + int(display_row_offset)
 
         self.alpha = float(alpha)
@@ -136,10 +132,6 @@ class OutlierDetection:
         n = len(self.data)
         self._results = {
             "n": int(n),
-            "n_input": getattr(self, "n_input", int(n)),
-            "n_removed_non_finite": getattr(self, "n_removed_non_finite", 0),
-            "non_finite_original_indices": getattr(self, "non_finite_original_indices", []),
-            "non_finite_display_rows": getattr(self, "non_finite_display_rows", []),
             "alpha": self.alpha,
             "input_valid": n >= 2,
             "warnings": [],
@@ -147,11 +139,6 @@ class OutlierDetection:
             "consensus": [],
             "consensus_min_methods": self.consensus_min_methods,
         }
-
-        if getattr(self, "n_removed_non_finite", 0):
-            self._results["warnings"].append(
-                f"{self.n_removed_non_finite} valeur(s) non finie(s) (NaN/Inf) exclue(s) de l'analyse."
-            )
 
         if n == 0:
             self._results.update({
@@ -425,43 +412,27 @@ class OutlierDetection:
                 item["original_index"] = int(original_idx)
                 item["display_row"] = int(display_row)
 
-        all_detected = []
-        confirmed_outliers = []
-        suspect_points = []
+        consensus = []
         for local_idx, item in detected.items():
             score = len(item["methods"])
-            confirmed = score >= self.consensus_min_methods
-            if confirmed:
-                severity = "forte" if score >= max(self.consensus_min_methods + 2, 4) else "confirmée"
+            if score >= self.consensus_min_methods:
+                severity = "forte"
             elif score == 1:
                 severity = "à surveiller"
             else:
                 severity = "modérée"
-            record = {
+            consensus.append({
                 "index": int(local_idx),
                 "original_index": item["original_index"],
                 "display_row": item["display_row"],
                 "value": item["value"],
                 "detected_by": item["methods"],
                 "score": int(score),
-                "confirmed": bool(confirmed),
                 "severity": severity,
                 "recommendation": "Investiguer avant toute exclusion. Ne pas supprimer automatiquement.",
-            }
-            all_detected.append(record)
-            if confirmed:
-                confirmed_outliers.append(record)
-            else:
-                suspect_points.append(record)
-
-        all_detected.sort(key=lambda d: (-d["score"], d["display_row"]))
-        confirmed_outliers.sort(key=lambda d: (-d["score"], d["display_row"]))
-        suspect_points.sort(key=lambda d: (-d["score"], d["display_row"]))
-        self._results["all_detected_points"] = all_detected
-        self._results["confirmed_outliers"] = confirmed_outliers
-        self._results["suspect_points"] = suspect_points
-        # Compatibilité API historique : consensus conserve tous les points détectés, avec le champ confirmed.
-        self._results["consensus"] = all_detected
+            })
+        consensus.sort(key=lambda x: (-x["score"], x["display_row"]))
+        self._results["consensus"] = consensus
 
     def get_results(self) -> Dict[str, Any]:
         return self._results

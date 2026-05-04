@@ -1,185 +1,165 @@
 import os
-import json
-from typing import Dict, Any, List, Optional
+import html
+from pathlib import Path
+from typing import Dict, Any, List
 from datetime import datetime
 
 
 class ReportExporter:
-    """Export des résultats statistiques en TXT, PDF, DOCX, ODT"""
+    """Export robuste des résultats statistiques en TXT, PDF, DOCX, ODT.
+
+    Améliorations v2 :
+    - PDF via ReportLab en priorité pour meilleure compatibilité Unicode ;
+    - échappement HTML/XML pour les Paragraph ReportLab ;
+    - chemins gérés avec pathlib ;
+    - fallback TXT explicite avec chemin robuste ;
+    - API compatible : add_section(), add_summary(), export_*(), export().
+    """
 
     def __init__(self, report_title: str = "Rapport statistique"):
-        self.title = report_title
+        self.title = str(report_title or "Rapport statistique")
         self.sections: List[Dict[str, Any]] = []
         self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def add_section(self, title: str, content: str):
-        """Ajoute une section au rapport"""
-        self.sections.append({"title": title, "content": content})
+        self.sections.append({"title": str(title or "Sans titre"), "content": "" if content is None else str(content)})
 
     def add_summary(self, summary: str):
-        """Ajoute un résumé global"""
         self.add_section("RÉSUMÉ", summary)
 
+    def _ensure_parent(self, filepath: str) -> Path:
+        path = Path(filepath)
+        if path.parent and str(path.parent) not in ("", "."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _fallback_txt_path(self, filepath: str) -> Path:
+        path = Path(filepath)
+        if path.suffix:
+            return path.with_suffix(".txt")
+        return path.parent / f"{path.name}.txt"
+
     def export_txt(self, filepath: str):
-        """Export en format texte brut"""
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(f"{'='*60}\n")
+        path = self._ensure_parent(filepath)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{'=' * 60}\n")
             f.write(f"{self.title}\n")
             f.write(f"Date: {self.timestamp}\n")
-            f.write(f"{'='*60}\n\n")
-
+            f.write(f"{'=' * 60}\n\n")
             for section in self.sections:
-                f.write(f"\n{'─'*60}\n")
+                f.write(f"\n{'─' * 60}\n")
                 f.write(f"  {section['title']}\n")
-                f.write(f"{'─'*60}\n\n")
-                f.write(section['content'])
+                f.write(f"{'─' * 60}\n\n")
+                f.write(section["content"])
                 f.write("\n\n")
-
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Fin du rapport\n")
+            f.write(f"\n{'=' * 60}\n")
+            f.write("Fin du rapport\n")
+        return str(path)
 
     def export_pdf(self, filepath: str):
-        """Export en PDF (via fpdf si disponible, sinon fallback TXT)"""
+        """Export PDF via ReportLab. En cas d'absence de ReportLab, crée un TXT de fallback."""
+        path = self._ensure_parent(filepath)
         try:
-            from fpdf import FPDF
-            self._export_pdf_fpdf(filepath)
-        except ImportError:
-            try:
-                from reportlab.lib.pagesizes import letter
-                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-                from reportlab.lib.styles import getSampleStyleSheet
-                from reportlab.lib.units import inch
-                self._export_pdf_reportlab(filepath)
-            except ImportError:
-                # Fallback: créer un TXT avec extension .pdf
-                txt_path = filepath.replace('.pdf', '.txt')
-                self.export_txt(txt_path)
-                raise ImportError("Aucune bibliothèque PDF disponible. Export TXT créé à la place.")
-
-    def _export_pdf_fpdf(self, filepath: str):
-        from fpdf import FPDF
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
-
-        # Page de titre
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 24)
-        pdf.cell(0, 20, self.title, new_x="LM", new_y="NEXT", align="C")
-        pdf.set_font("Helvetica", "", 12)
-        pdf.cell(0, 10, f"Date: {self.timestamp}", new_x="LM", new_y="NEXT", align="C")
-        pdf.ln(10)
-
-        # Sections
-        for section in self.sections:
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, section['title'], new_x="LM", new_y="NEXT")
-            pdf.ln(5)
-
-            pdf.set_font("Courier", "", 9)
-            for line in section['content'].split('\n'):
-                # Encodage sécurisé pour fpdf
-                try:
-                    pdf.cell(0, 5, line.encode('latin-1', 'replace').decode('latin-1'), new_x="LM", new_y="NEXT")
-                except Exception:
-                    pdf.cell(0, 5, line, new_x="LM", new_y="NEXT")
-                pdf.ln(1)
-
-        pdf.output(filepath)
+            self._export_pdf_reportlab(str(path))
+            return str(path)
+        except ImportError as exc:
+            txt_path = self._fallback_txt_path(str(path))
+            self.export_txt(str(txt_path))
+            raise ImportError(f"ReportLab non disponible. Export TXT créé à la place : {txt_path}") from exc
 
     def _export_pdf_reportlab(self, filepath: str):
-        from reportlab.lib.pagesizes import letter
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.lib.units import inch
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.pdfbase.pdfmetrics import stringWidth
 
-        doc = SimpleDocTemplate(filepath, pagesize=letter)
+        doc = SimpleDocTemplate(
+            filepath,
+            pagesize=A4,
+            rightMargin=1.5 * cm,
+            leftMargin=1.5 * cm,
+            topMargin=1.5 * cm,
+            bottomMargin=1.5 * cm,
+        )
         styles = getSampleStyleSheet()
+        code_style = ParagraphStyle(
+            "StatProCode",
+            parent=styles["Code"],
+            fontName="Courier",
+            fontSize=8,
+            leading=10,
+            wordWrap="CJK",
+        )
         story = []
+        story.append(Paragraph(f"<b><font size='18'>{html.escape(self.title)}</font></b>", styles["Title"]))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"Date: {html.escape(self.timestamp)}", styles["Normal"]))
+        story.append(Spacer(1, 18))
 
-        # Titre
-        story.append(Paragraph(f"<b><font size=18>{self.title}</font></b>", styles['Title']))
-        story.append(Spacer(1, 10))
-        story.append(Paragraph(f"Date: {self.timestamp}", styles['Normal']))
-        story.append(Spacer(1, 20))
-
-        for section in self.sections:
-            story.append(Paragraph(f"<b>{section['title']}</b>", styles['Heading2']))
-            story.append(Spacer(1, 10))
-            for line in section['content'].split('\n'):
-                story.append(Paragraph(line, styles['Code']))
-            story.append(PageBreak())
-
+        for idx, section in enumerate(self.sections):
+            if idx > 0:
+                story.append(PageBreak())
+            story.append(Paragraph(f"<b>{html.escape(section['title'])}</b>", styles["Heading2"]))
+            story.append(Spacer(1, 8))
+            for block in section["content"].split("\n"):
+                if block.strip() == "":
+                    story.append(Spacer(1, 4))
+                else:
+                    # Preformatted préserve les alignements de tableaux texte et gère correctement les caractères échappés.
+                    story.append(Preformatted(html.escape(block), code_style))
         doc.build(story)
 
     def export_docx(self, filepath: str):
-        """Export en DOCX (via python-docx)"""
+        path = self._ensure_parent(filepath)
         try:
             from docx import Document
-            from docx.shared import Pt, Inches
+            from docx.shared import Pt
             doc = Document()
-
-            # Titre
             doc.add_heading(self.title, level=0)
             doc.add_paragraph(f"Date: {self.timestamp}")
             doc.add_paragraph("")
-
             for section in self.sections:
-                doc.add_heading(section['title'], level=1)
-                doc.add_paragraph("")
-                # Ajouter le contenu ligne par ligne
-                for line in section['content'].split('\n'):
-                    if line.strip():
-                        p = doc.add_paragraph(line)
-                        p.paragraph_format.space_after = Pt(2)
-
-            doc.save(filepath)
-        except ImportError:
-            # Fallback: créer un TXT avec extension .docx
-            txt_path = filepath.replace('.docx', '.txt')
-            self.export_txt(txt_path)
-            raise ImportError("python-docx non disponible. Export TXT créé à la place.")
+                doc.add_heading(section["title"], level=1)
+                for line in section["content"].split("\n"):
+                    p = doc.add_paragraph(line)
+                    p.paragraph_format.space_after = Pt(2)
+            doc.save(str(path))
+            return str(path)
+        except ImportError as exc:
+            txt_path = self._fallback_txt_path(str(path))
+            self.export_txt(str(txt_path))
+            raise ImportError(f"python-docx non disponible. Export TXT créé à la place : {txt_path}") from exc
 
     def export_odt(self, filepath: str):
-        """Export en ODT (via odfpy)"""
+        path = self._ensure_parent(filepath)
         try:
             from odf.opendocument import OpenDocumentText
             from odf.text import P, H
-            from odf.style import Style, TextProperties
             doc = OpenDocumentText()
-
-            # Titre
-            title = P(text=self.title)
-            doc.text.addElement(title)
-
-            date_p = P(text=f"Date: {self.timestamp}")
-            doc.text.addElement(date_p)
-
+            doc.text.addElement(P(text=self.title))
+            doc.text.addElement(P(text=f"Date: {self.timestamp}"))
             for section in self.sections:
-                heading = H(text=section['title'], outlinelevel=1)
-                doc.text.addElement(heading)
-                for line in section['content'].split('\n'):
+                doc.text.addElement(H(text=section["title"], outlinelevel=1))
+                for line in section["content"].split("\n"):
                     if line.strip():
-                        p = P(text=line)
-                        doc.text.addElement(p)
-
-            doc.save(filepath)
-        except ImportError:
-            # Fallback: créer un TXT avec extension .odt
-            txt_path = filepath.replace('.odt', '.txt')
-            self.export_txt(txt_path)
-            raise ImportError("odfpy non disponible. Export TXT créé à la place.")
+                        doc.text.addElement(P(text=line))
+            doc.save(str(path))
+            return str(path)
+        except ImportError as exc:
+            txt_path = self._fallback_txt_path(str(path))
+            self.export_txt(str(txt_path))
+            raise ImportError(f"odfpy non disponible. Export TXT créé à la place : {txt_path}") from exc
 
     def export(self, filepath: str):
-        """Export automatique selon l'extension"""
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext == '.txt':
-            self.export_txt(filepath)
-        elif ext == '.pdf':
-            self.export_pdf(filepath)
-        elif ext == '.docx':
-            self.export_docx(filepath)
-        elif ext == '.odt':
-            self.export_odt(filepath)
-        else:
-            self.export_txt(filepath)
+        ext = Path(filepath).suffix.lower()
+        if ext == ".txt" or ext == "":
+            return self.export_txt(filepath)
+        if ext == ".pdf":
+            return self.export_pdf(filepath)
+        if ext == ".docx":
+            return self.export_docx(filepath)
+        if ext == ".odt":
+            return self.export_odt(filepath)
+        # Extension inconnue : conserve le chemin demandé mais écrit un contenu texte UTF-8.
+        return self.export_txt(filepath)
