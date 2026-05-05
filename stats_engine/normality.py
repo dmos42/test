@@ -125,8 +125,9 @@ class NormalityTests:
             result = stats.anderson(self.data, dist="norm")
             statistic = float(result.statistic)
             sig_levels = np.asarray(result.significance_level, dtype=float) / 100.0
-            p_value = self._interpolate_anderson_pvalue(statistic, np.asarray(result.critical_values, dtype=float), sig_levels)
-            critical_at_alpha = float(np.interp(self.alpha, sig_levels[::-1], np.asarray(result.critical_values)[::-1]))
+            critical_values = np.asarray(result.critical_values, dtype=float)
+            p_value = self._anderson_darling_pvalue_minitab_like(statistic, len(self.data))
+            critical_at_alpha = float(np.interp(self.alpha, sig_levels[::-1], critical_values[::-1]))
             self._results["tests"][name] = {
                 "statistic": statistic,
                 "p_value": p_value,
@@ -134,6 +135,7 @@ class NormalityTests:
                 "critical_values": result.critical_values.tolist(),
                 "significance_levels": result.significance_level.tolist(),
                 "critical_value_alpha": critical_at_alpha,
+                "p_value_method": "approximation continue type Minitab-like",
                 "status": "ok",
                 "description": desc,
             }
@@ -173,6 +175,33 @@ class NormalityTests:
             self._results["tests"][name] = {"statistic": float(stat), "p_value": float(p_value), "normal": bool(p_value > self.alpha), "status": "ok", "description": desc}
         except Exception as e:
             self._add_error(name, desc, e)
+
+
+    def _anderson_darling_pvalue_minitab_like(self, statistic, n) -> float:
+        """Approximation continue de la p-value Anderson-Darling pour la normalité.
+
+        scipy.stats.anderson ne retourne pas directement de p-value. Cette
+        approximation utilise la statistique A² corrigée de la taille d'échantillon
+        et fournit une p-value continue, plus proche des logiciels qualité type
+        Minitab que l'interpolation des seules valeurs critiques SciPy.
+        """
+        a2 = float(statistic)
+        n = int(n)
+        if n <= 0 or not np.isfinite(a2):
+            return np.nan
+
+        a2_star = a2 * (1.0 + 0.75 / n + 2.25 / (n ** 2))
+
+        if a2_star < 0.2:
+            p = 1.0 - np.exp(-13.436 + 101.14 * a2_star - 223.73 * a2_star ** 2)
+        elif a2_star < 0.34:
+            p = 1.0 - np.exp(-8.318 + 42.796 * a2_star - 59.938 * a2_star ** 2)
+        elif a2_star < 0.6:
+            p = np.exp(0.9177 - 4.279 * a2_star - 1.38 * a2_star ** 2)
+        else:
+            p = np.exp(1.2937 - 5.709 * a2_star + 0.0186 * a2_star ** 2)
+
+        return max(0.0, min(1.0, float(p)))
 
     def _d_agostino_pearson(self):
         name = "D'Agostino-Pearson"; desc = "Test de D'Agostino-Pearson (basé sur asymétrie et aplatissement)"

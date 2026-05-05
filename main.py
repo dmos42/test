@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import re
+import html
 import logging
 import traceback
 import tempfile
@@ -27,7 +28,7 @@ from PyQt5.QtWidgets import (
     QFrame, QToolBar, QSizePolicy, QListWidget, QListWidgetItem, QStackedWidget, QStyle,
 )
 from PyQt5.QtCore import Qt, QMimeData, pyqtSignal
-from PyQt5.QtGui import QFont, QKeySequence, QPixmap, QIcon
+from PyQt5.QtGui import QFont, QKeySequence, QPixmap, QIcon, QColor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,33 +44,6 @@ try:
 except ImportError:
     from doe import FullFactorialDOE, TaguchiOA, ResponseSurfaceDOE, DOEAnalyzer
 
-try:
-    # Structure recommandée : stats_engine/miniqual.py
-    from stats_engine.miniqual import (
-        SUPPORTED_DISTRIBUTIONS, LABEL,
-        read_table, numeric_series, descriptive,
-        fit_distribution, distribution_pvalues, chi_square_gof,
-        boxcox_transform, validate_capability, status,
-        capability, outlier_tests, normality_tests,
-        nonnormal_capability, dashboard,
-        write_excel, write_docx,
-        save_project, load_project,
-    )
-except ImportError:
-    # Structure séparée simple : miniqual.py à côté de main.py
-    from miniqual import (
-        SUPPORTED_DISTRIBUTIONS, LABEL,
-        read_table, numeric_series, descriptive,
-        fit_distribution, distribution_pvalues, chi_square_gof,
-        boxcox_transform, validate_capability, status,
-        capability, outlier_tests, normality_tests,
-        nonnormal_capability, dashboard,
-        write_excel, write_docx,
-        save_project, load_project,
-    )
-
-# ===== FIN MINIQUAL CORE =====
-
 NUM_COLS = 26
 NUM_ROWS = 500
 
@@ -82,11 +56,171 @@ def col_letter(n):
     return result
 
 
+
+# ===== Anderson-Darling multi-distributions (Minitab-like / bootstrap) =====
+def _statpro_ad_statistic_from_cdf(data, cdf_func):
+    """Statistique Anderson-Darling à partir d'une CDF ajustée."""
+    x = np.sort(np.asarray(data, dtype=float))
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 3:
+        raise ValueError("Au moins 3 valeurs finies sont nécessaires pour Anderson-Darling.")
+    u = np.asarray(cdf_func(x), dtype=float)
+    eps = np.finfo(float).eps
+    u = np.clip(u, eps, 1.0 - eps)
+    i = np.arange(1, n + 1, dtype=float)
+    return float(-n - np.mean((2.0 * i - 1.0) * (np.log(u) + np.log(1.0 - u[::-1]))))
+
+
+def _statpro_ad_pvalue_normal_minitab_like(statistic, n):
+    """Approximation continue de p-value AD normalité, proche logiciels qualité type Minitab."""
+    a2 = float(statistic)
+    n = int(n)
+    if n <= 0 or not np.isfinite(a2):
+        return np.nan
+    a2_star = a2 * (1.0 + 0.75 / n + 2.25 / (n ** 2))
+    if a2_star < 0.2:
+        p = 1.0 - np.exp(-13.436 + 101.14 * a2_star - 223.73 * a2_star ** 2)
+    elif a2_star < 0.34:
+        p = 1.0 - np.exp(-8.318 + 42.796 * a2_star - 59.938 * a2_star ** 2)
+    elif a2_star < 0.6:
+        p = np.exp(0.9177 - 4.279 * a2_star - 1.38 * a2_star ** 2)
+    else:
+        p = np.exp(1.2937 - 5.709 * a2_star + 0.0186 * a2_star ** 2)
+    return max(0.0, min(1.0, float(p)))
+
+
+def _statpro_ad_bootstrap_gof(data, dist_obj, fit_func, *, n_boot=300, random_state=12345):
+    """p-value Anderson-Darling par bootstrap paramétrique avec réajustement.
+
+    La p-value est estimée par proportion des statistiques simulées >= statistique observée.
+    Cette approche est plus fiable qu'un KS naïf quand les paramètres de la loi sont estimés.
+    """
+    x = np.asarray(data, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) < 5:
+        raise ValueError("Au moins 5 valeurs sont recommandées pour le bootstrap Anderson-Darling.")
+    params = fit_func(x)
+    obs = _statpro_ad_statistic_from_cdf(x, lambda v: dist_obj.cdf(v, *params))
+    rng = np.random.default_rng(random_state)
+    sims = []
+    attempts = 0
+    max_attempts = int(n_boot * 3)
+    while len(sims) < n_boot and attempts < max_attempts:
+        attempts += 1
+        try:
+            sample = dist_obj.rvs(*params, size=len(x), random_state=rng)
+            sample = np.asarray(sample, dtype=float)
+            sample = sample[np.isfinite(sample)]
+            if len(sample) != len(x) or np.nanstd(sample, ddof=1) <= 0:
+                continue
+            sim_params = fit_func(sample)
+            sim_stat = _statpro_ad_statistic_from_cdf(sample, lambda v: dist_obj.cdf(v, *sim_params))
+            if np.isfinite(sim_stat):
+                sims.append(float(sim_stat))
+        except Exception:
+            continue
+    if len(sims) < max(50, n_boot // 3):
+        raise ValueError("Bootstrap Anderson-Darling insuffisant pour estimer une p-value fiable.")
+    sims = np.asarray(sims, dtype=float)
+    p_value = (1.0 + float(np.sum(sims >= obs))) / (len(sims) + 1.0)
+    return float(obs), float(p_value), params, int(len(sims))
+
+
+def _statpro_distribution_specs_for_ad():
+    """Spécifications des lois pour identification par Anderson-Darling."""
+    return {
+        "Normal": {
+            "dist_name": "norm", "obj": scipy_stats.norm,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.norm.fit(d),
+            "method": "normal_minitab_like",
+            "constraint": "valeurs finies",
+        },
+        "Log-Normale": {
+            "dist_name": "lognorm", "obj": scipy_stats.lognorm,
+            "filter": lambda d: d[(d > 0) & np.isfinite(d)],
+            "fit": lambda d: scipy_stats.lognorm.fit(d, floc=0),
+            "method": "lognormal_minitab_like",
+            "constraint": "valeurs strictement positives",
+        },
+        "Weibull (2P)": {
+            "dist_name": "weibull_min", "obj": scipy_stats.weibull_min,
+            "filter": lambda d: d[(d > 0) & np.isfinite(d)],
+            "fit": lambda d: scipy_stats.weibull_min.fit(d, floc=0),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs strictement positives",
+        },
+        "Exponentielle": {
+            "dist_name": "expon", "obj": scipy_stats.expon,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.expon.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+        "Gamma": {
+            "dist_name": "gamma", "obj": scipy_stats.gamma,
+            "filter": lambda d: d[(d > 0) & np.isfinite(d)],
+            "fit": lambda d: scipy_stats.gamma.fit(d, floc=0),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs strictement positives",
+        },
+        "Logistique": {
+            "dist_name": "logistic", "obj": scipy_stats.logistic,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.logistic.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+        "Gumbel (max)": {
+            "dist_name": "gumbel_r", "obj": scipy_stats.gumbel_r,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.gumbel_r.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+        "Cauchy": {
+            "dist_name": "cauchy", "obj": scipy_stats.cauchy,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.cauchy.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+        "Rayleigh": {
+            "dist_name": "rayleigh", "obj": scipy_stats.rayleigh,
+            "filter": lambda d: d[(d > 0) & np.isfinite(d)],
+            "fit": lambda d: scipy_stats.rayleigh.fit(d, floc=0),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs strictement positives",
+        },
+        "Uniforme": {
+            "dist_name": "uniform", "obj": scipy_stats.uniform,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.uniform.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+        "Student-t": {
+            "dist_name": "t", "obj": scipy_stats.t,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.t.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+        "Laplace": {
+            "dist_name": "laplace", "obj": scipy_stats.laplace,
+            "filter": lambda d: d[np.isfinite(d)],
+            "fit": lambda d: scipy_stats.laplace.fit(d),
+            "method": "bootstrap_ad",
+            "constraint": "valeurs finies",
+        },
+    }
+
 class DataSheet(QTableWidget):
     def __init__(self, parent=None):
         super().__init__(NUM_ROWS, NUM_COLS, parent)
         self.setHorizontalHeaderLabels([col_letter(i) for i in range(NUM_COLS)])
-        self.setVerticalHeaderLabels([str(i + 1) for i in range(NUM_ROWS)])
+        self.setVerticalHeaderLabels(["Nom"] + [str(i) for i in range(1, NUM_ROWS)])
 
         header = self.horizontalHeader()
         # Colonnes redimensionnables manuellement et plus larges par défaut.
@@ -138,6 +272,9 @@ class DataSheet(QTableWidget):
         self._max_undo = 30
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._updating_name_row = False
+        self._init_name_row()
+        self.itemChanged.connect(self._on_item_changed)
 
     def _show_context_menu(self, pos):
         menu = QMenu(self)
@@ -177,6 +314,11 @@ class DataSheet(QTableWidget):
 
         clear_col_action = menu.addAction(" Effacer colonne")
         clear_col_action.triggered.connect(self._clear_column)
+
+        menu.addSeparator()
+
+        rename_col_action = menu.addAction(" Renommer colonne...")
+        rename_col_action.triggered.connect(self._rename_current_column)
         
         menu.addSeparator()
         
@@ -184,6 +326,91 @@ class DataSheet(QTableWidget):
         stats_action.triggered.connect(self._quick_stats)
         
         menu.exec_(self.mapToGlobal(pos))
+
+    def _style_name_item(self, item):
+        if item is None:
+            return
+        item.setBackground(QColor("#eeeeee"))
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+
+    def _init_name_row(self):
+        self._updating_name_row = True
+        try:
+            for col in range(self.columnCount()):
+                item = self.item(0, col)
+                if item is None:
+                    item = QTableWidgetItem("")
+                    super().setItem(0, col, item)
+                self._style_name_item(item)
+        finally:
+            self._updating_name_row = False
+
+    def setItem(self, row, column, item):
+        if row == 0 and item is not None:
+            self._style_name_item(item)
+        super().setItem(row, column, item)
+
+    def clearContents(self):
+        super().clearContents()
+        self._init_name_row()
+
+    def get_column_label(self, col_idx, fallback=True):
+        item = self.item(0, col_idx)
+        if item:
+            txt = item.text().strip()
+            if txt:
+                return txt
+        return col_letter(col_idx) if fallback else ""
+
+    def update_column_headers(self):
+        """Les en-têtes restent les lettres ; la ligne 0 contient les noms utilisés dans les analyses."""
+        self.setHorizontalHeaderLabels([col_letter(i) for i in range(self.columnCount())])
+        self.setVerticalHeaderLabels(["Nom"] + [str(i) for i in range(1, self.rowCount())])
+        self._init_name_row()
+
+    def _notify_column_names_changed(self):
+        try:
+            win = self.window()
+            if hasattr(win, "_refresh_all_combos"):
+                win._refresh_all_combos()
+            if hasattr(win, "status_bar"):
+                win.status_bar.showMessage("Noms de colonnes mis à jour")
+        except Exception:
+            pass
+
+    def _on_item_changed(self, item):
+        if item is None or getattr(self, "_updating_name_row", False):
+            return
+        if item.row() == 0:
+            self._updating_name_row = True
+            try:
+                self._style_name_item(item)
+            finally:
+                self._updating_name_row = False
+            self._notify_column_names_changed()
+
+    def _rename_current_column(self):
+        current = self.currentIndex()
+        if not current.isValid():
+            return
+        col = current.column()
+        from PyQt5.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Renommer colonne", f"Nom de la colonne {col_letter(col)} :", text=self.get_column_label(col, fallback=False))
+        if not ok:
+            return
+        item = self.item(0, col) or QTableWidgetItem("")
+        item.setText(str(name).strip())
+        self.setItem(0, col, item)
+        self.update_column_headers()
+        self._notify_column_names_changed()
+
+    def use_first_row_as_headers(self):
+        self.update_column_headers()
+        self._notify_column_names_changed()
+
 
     def _serialize_cells(self):
         data = {}
@@ -261,8 +488,7 @@ class DataSheet(QTableWidget):
             return
         row = current.row()
         self.insertRow(row)
-        new_label = [str(i + 1) for i in range(self.rowCount())]
-        self.setVerticalHeaderLabels(new_label)
+        self.update_column_headers()
 
     def _delete_row(self):
         self._push_undo()
@@ -271,15 +497,14 @@ class DataSheet(QTableWidget):
             return
         row = current.row()
         self.removeRow(row)
-        new_label = [str(i + 1) for i in range(self.rowCount())]
-        self.setVerticalHeaderLabels(new_label)
+        self.update_column_headers()
 
     def _insert_col(self):
         self._push_undo()
         current = self.currentIndex()
         col = current.column() if current.isValid() else self.columnCount()
         self.insertColumn(col)
-        self.setHorizontalHeaderLabels([col_letter(i) for i in range(self.columnCount())])
+        self.update_column_headers()
 
     def _delete_col(self):
         current = self.currentIndex()
@@ -287,7 +512,7 @@ class DataSheet(QTableWidget):
             return
         self._push_undo()
         self.removeColumn(current.column())
-        self.setHorizontalHeaderLabels([col_letter(i) for i in range(self.columnCount())])
+        self.update_column_headers()
 
     def _clear_column(self):
         current = self.currentIndex()
@@ -407,7 +632,7 @@ class DataSheet(QTableWidget):
         if col_idx < 0 or col_idx >= self.columnCount():
             return None
 
-        for row in range(self.rowCount()):
+        for row in range(1, self.rowCount()):
             item = self.item(row, col_idx)
             if item and item.text().strip():
                 txt = item.text().strip().replace(",", ".")
@@ -423,7 +648,7 @@ class DataSheet(QTableWidget):
             selected = self.selectionModel().selectedIndexes()
             if not selected:
                 cols = set()
-                for row in range(self.rowCount()):
+                for row in range(1, self.rowCount()):
                     for col in range(self.columnCount()):
                         item = self.item(row, col)
                         if item and item.text().strip():
@@ -442,27 +667,26 @@ class DataSheet(QTableWidget):
 
     def load_from_dataframe(self, df):
         self.clearContents()
-
-        max_rows = min(len(df), self.rowCount())
+        max_rows = min(len(df), self.rowCount() - 1)
         max_cols = min(len(df.columns), self.columnCount())
-
-        self.setHorizontalHeaderLabels([col_letter(i) for i in range(self.columnCount())])
-
         for col_idx in range(max_cols):
+            self.setItem(0, col_idx, QTableWidgetItem(str(df.columns[col_idx])))
             for row_idx in range(max_rows):
                 val = df.iloc[row_idx, col_idx]
                 if pd.isna(val):
                     continue
                 item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.setItem(row_idx, col_idx, item)
+                self.setItem(row_idx + 1, col_idx, item)
+        self.update_column_headers()
+
 
     def load_from_array(self, data, start_col=0):
-        max_rows = min(len(data), NUM_ROWS)
+        max_rows = min(len(data), NUM_ROWS - 1)
         for row_idx in range(max_rows):
             item = QTableWidgetItem(f"{data[row_idx]:.6f}")
             item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.setItem(row_idx, start_col, item)
+            self.setItem(row_idx + 1, start_col, item)
 
 
 class GenerateDataDialog(QDialog):
@@ -655,7 +879,6 @@ class VerticalNavTabs(QWidget):
         "Régression": "Tests statistiques",
         "Boxplots": "Graphiques",
         "Rapport d'analyse": "Rapport",
-        "MiniQual": "Rapport",
     }
 
     def __init__(self, parent=None):
@@ -886,7 +1109,6 @@ class StatisticalApp(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Exporter résultats", self._export_results)
         file_menu.addAction("Exporter rapport complet PDF/DOCX...", self._export_full_report)
-        file_menu.addAction("Exporter Excel multi-feuilles...", self._export_excel_workbook)
         file_menu.addSeparator()
         file_menu.addAction("Quitter", self.close)
 
@@ -945,7 +1167,6 @@ class StatisticalApp(QMainWindow):
         self._create_control_charts_tab()
         self._create_probplot_tab()
         self._create_msa_tab()
-        self._create_miniqual_tab()
         self._create_report_tab()
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -964,47 +1185,25 @@ class StatisticalApp(QMainWindow):
 
     def _refresh_all_combos(self):
         combos = []
-
         for attr in dir(self):
             obj = getattr(self, attr)
             if isinstance(obj, QComboBox):
-                if attr.endswith("_col_combo") or attr in (
-                    "reg_y_combo", "reg_x_combo", "tt_col1_combo", "tt_col2_combo",
-                    "msa_part_combo", "msa_op_combo", "msa_meas_combo", "cc_col_combo",
-                    "prob_col_combo", "corr_col_combo", "doe_response_combo",
-                ):
+                if attr.endswith("_col_combo") or attr in ("reg_y_combo", "reg_x_combo", "tt_col1_combo", "tt_col2_combo", "msa_part_combo", "msa_op_combo", "msa_meas_combo", "cc_col_combo", "prob_col_combo", "corr_col_combo", "doe_response_combo"):
                     combos.append(obj)
-
-        unique = []
-        seen = set()
+        unique, seen = [], set()
         for combo in combos:
             if id(combo) not in seen:
-                seen.add(id(combo))
-                unique.append(combo)
-
-        cols = []
-        if hasattr(self, "sheet"):
-            for i in range(self.sheet.columnCount()):
-                data = self.sheet.get_column_data(i)
-                if data is not None and len(data) > 0:
-                    cols.append(col_letter(i))
-
-        if not cols:
-            cols = ["(aucune donnée)"]
-
+                seen.add(id(combo)); unique.append(combo)
+        items = self._column_display_items(only_with_data=True)
         for combo in unique:
-            current = combo.currentText()
-            combo.clear()
-            combo.addItems(cols)
-            if current in cols:
-                combo.setCurrentText(current)
+            self._populate_column_combo(combo, items)
+        for name in ("_update_anova_combos", "_update_boxplot_combos", "_update_correlation_combos", "_update_doe_factor_combos"):
+            if hasattr(self, name):
+                try:
+                    getattr(self, name)()
+                except Exception:
+                    pass
 
-        if hasattr(self, "anova_col_combos") and hasattr(self, "anova_combo_layout"):
-            self._update_anova_combos()
-        if hasattr(self, "boxplot_col_combos") and hasattr(self, "boxplot_combo_layout"):
-            self._update_boxplot_combos()
-        if hasattr(self, "corr_col_combos") and hasattr(self, "corr_combo_layout"):
-            self._update_correlation_combos()
 
     def _create_data_tab(self):
         tab = QWidget()
@@ -1156,6 +1355,7 @@ class StatisticalApp(QMainWindow):
         self.dist_result_text.setReadOnly(True)
         self.dist_result_text.setFont(QFont("Courier", 10))
         result_layout.addWidget(self.dist_result_text)
+        self._add_copy_button(result_layout, self.dist_result_text)
         left_layout.addWidget(result_group)
 
     def _run_distribution(self):
@@ -1163,90 +1363,100 @@ class StatisticalApp(QMainWindow):
         if data is None:
             QMessageBox.warning(self, "Attention", "Sélectionnez une colonne")
             return
-
         try:
+            data = np.asarray(data, dtype=float)
+            data = data[np.isfinite(data)]
+            if len(data) < 5:
+                QMessageBox.warning(self, "Attention", "Au moins 5 valeurs numériques sont recommandées pour identifier une distribution.")
+                return
             alpha = self.dist_alpha.value()
-
-            dist_map = {
-                "Normal": ("norm", lambda d: scipy_stats.norm.fit(d)),
-                "Log-Normale": ("lognorm", lambda d: scipy_stats.lognorm.fit(d, floc=0)),
-                "Weibull (2P)": ("weibull_min", lambda d: scipy_stats.weibull_min.fit(d, floc=0)),
-                "Exponentielle": ("expon", lambda d: scipy_stats.expon.fit(d)),
-                "Gamma": ("gamma", lambda d: scipy_stats.gamma.fit(d, floc=0)),
-                "Logistique": ("logistic", lambda d: scipy_stats.logistic.fit(d)),
-                "Gumbel (max)": ("gumbel_r", lambda d: scipy_stats.gumbel_r.fit(d)),
-                "Cauchy": ("cauchy", lambda d: scipy_stats.cauchy.fit(d)),
-                "Rayleigh": ("rayleigh", lambda d: scipy_stats.rayleigh.fit(d, floc=0)),
-                "Uniforme": ("uniform", lambda d: scipy_stats.uniform.fit(d)),
-                "Student-t": ("t", lambda d: scipy_stats.t.fit(d)),
-                "Laplace": ("laplace", lambda d: scipy_stats.laplace.fit(d)),
-            }
-
+            dist_map = _statpro_distribution_specs_for_ad()
             results = []
             for display_name, cb in self.dist_checks.items():
-                if cb.isChecked() and display_name in dist_map:
-                    dist_name, fit_func = dist_map[display_name]
-                    try:
-                        params = fit_func(data)
-                        loc = params[-2] if len(params) >= 2 else 0
-                        scale = params[-1] if len(params) >= 1 else 1
-                        shape_params = params[:-2] if len(params) > 2 else ()
-
-                        ks_stat, ks_pvalue = scipy_stats.kstest(
-                            data, dist_name, args=params
+                if not cb.isChecked() or display_name not in dist_map:
+                    continue
+                spec = dist_map[display_name]
+                try:
+                    fit_data = np.asarray(spec["filter"](data), dtype=float)
+                    fit_data = fit_data[np.isfinite(fit_data)]
+                    if len(fit_data) < 5:
+                        raise ValueError(f"Données insuffisantes compatibles avec la loi ({spec['constraint']}).")
+                    if np.nanstd(fit_data, ddof=1) <= 0:
+                        raise ValueError("Données sans variabilité suffisante.")
+                    dist_obj = spec["obj"]
+                    if spec["method"] == "normal_minitab_like":
+                        params = spec["fit"](fit_data)
+                        ad_stat = _statpro_ad_statistic_from_cdf(fit_data, lambda v, p=params: dist_obj.cdf(v, *p))
+                        p_value = _statpro_ad_pvalue_normal_minitab_like(ad_stat, len(fit_data))
+                        p_method = "AD p-value approximation continue type Minitab-like"
+                        n_boot = None
+                    elif spec["method"] == "lognormal_minitab_like":
+                        # Une lognormale signifie que log(X) suit une normale : p-value AD type normalité sur log(X).
+                        log_data = np.log(fit_data)
+                        params = spec["fit"](fit_data)
+                        ad_stat = _statpro_ad_statistic_from_cdf(log_data, lambda v: scipy_stats.norm.cdf(v, *scipy_stats.norm.fit(log_data)))
+                        p_value = _statpro_ad_pvalue_normal_minitab_like(ad_stat, len(log_data))
+                        p_method = "AD lognormal via log(X) + approximation continue type Minitab-like"
+                        n_boot = None
+                    else:
+                        ad_stat, p_value, params, n_boot = _statpro_ad_bootstrap_gof(
+                            fit_data, dist_obj, spec["fit"], n_boot=300, random_state=12345
                         )
-                        results.append({
-                            "name": display_name,
-                            "dist_name": dist_name,
-                            "params": params,
-                            "ks_stat": ks_stat,
-                            "p_value": ks_pvalue,
-                            "passes": ks_pvalue > alpha,
-                        })
-                    except Exception:
-                        results.append({
-                            "name": display_name,
-                            "dist_name": dist_name,
-                            "params": None,
-                            "ks_stat": None,
-                            "p_value": None,
-                            "passes": False,
-                            "error": True,
-                        })
-
+                        p_method = f"AD bootstrap paramétrique avec réajustement ({n_boot} simulations)"
+                    results.append({
+                        "name": display_name,
+                        "dist_name": spec["dist_name"],
+                        "params": params,
+                        "ad_stat": ad_stat,
+                        "p_value": p_value,
+                        "passes": p_value > alpha,
+                        "p_method": p_method,
+                        "n_used": int(len(fit_data)),
+                        "n_boot": n_boot,
+                    })
+                except Exception as e:
+                    results.append({
+                        "name": display_name,
+                        "dist_name": spec.get("dist_name", display_name),
+                        "params": None,
+                        "ad_stat": None,
+                        "p_value": None,
+                        "passes": False,
+                        "error": True,
+                        "message": str(e),
+                    })
             results.sort(key=lambda r: r["p_value"] if r["p_value"] is not None else -1, reverse=True)
-
-            lines = ["=" * 60, "IDENTIFICATION DE DISTRIBUTION", "=" * 60]
+            lines = ["=" * 72, "IDENTIFICATION DE DISTRIBUTION - Anderson-Darling", "=" * 72]
             lines.append(f"\nColonne : {col_name}")
             lines.append(f"N = {len(data)}")
             lines.append(f"Moyenne = {np.mean(data):.6f}")
             lines.append(f"Écart-type = {np.std(data, ddof=1):.6f}")
             lines.append(f"Seuil α = {alpha}")
-            lines.append("\n" + "-" * 60)
-            lines.append(f"{'Rang':<6} {'Distribution':<18} {'KS Stat':<12} {'p-value':<12} {'Ajusté?':<10}")
-            lines.append("-" * 60)
-
+            lines.append("\nMéthode : Anderson-Darling. Normal et lognormal utilisent une approximation continue type Minitab-like ; les autres lois utilisent un bootstrap paramétrique avec réajustement.")
+            lines.append("\n" + "-" * 72)
+            lines.append(f"{'Rang':<6} {'Distribution':<18} {'AD Stat':<12} {'p-value':<12} {'Ajusté?':<10} {'N utilisé':<8}")
+            lines.append("-" * 72)
             best_dist = results[0] if results else None
             for i, r in enumerate(results):
                 if r.get("error"):
-                    lines.append(f"{i+1:<6} {r['name']:<18} {'ERREUR':<12} {'-':<12} {'NON':<10}")
+                    lines.append(f"{i+1:<6} {r['name']:<18} {'ERREUR':<12} {'-':<12} {'NON':<10} {'-':<8}")
+                    if r.get("message"):
+                        lines.append(f"      Motif : {r['message']}")
                 else:
-                    normal_str = "OUI" if r["passes"] else "NON"
-                    lines.append(f"{i+1:<6} {r['name']:<18} {r['ks_stat']:<12.6f} {r['p_value']:<12.6f} {normal_str:<10}")
-
-            lines.append("-" * 60)
+                    fit_str = "OUI" if r["passes"] else "NON"
+                    lines.append(f"{i+1:<6} {r['name']:<18} {r['ad_stat']:<12.6f} {r['p_value']:<12.6g} {fit_str:<10} {r.get('n_used','-'):<8}")
+            lines.append("-" * 72)
             if best_dist and not best_dist.get("error"):
                 lines.append(f"\nMeilleure distribution : {best_dist['name']}")
-                lines.append(f"  p-value = {best_dist['p_value']:.6f}")
-                lines.append(f"  Statistique KS = {best_dist['ks_stat']:.6f}")
+                lines.append(f" p-value = {best_dist['p_value']:.6g}")
+                lines.append(f" Statistique AD = {best_dist['ad_stat']:.6f}")
+                lines.append(f" Méthode p-value = {best_dist.get('p_method', 'n/a')}")
                 if best_dist["params"] is not None:
-                    lines.append(f"  Paramètres : {best_dist['params']}")
-            lines.append("=" * 60)
-
+                    lines.append(f" Paramètres : {best_dist['params']}")
+            lines.append("=" * 72)
             self.dist_result_text.setText("\n".join(lines))
             self._plot_distribution(data, results)
-            self.status_bar.showMessage("Identification de distribution terminée")
-
+            self.status_bar.showMessage("Identification de distribution Anderson-Darling terminée")
         except Exception as e:
             self._show_exception("Erreur", e, "Erreur lors de l'identification :")
 
@@ -1291,7 +1501,7 @@ class StatisticalApp(QMainWindow):
                 pdf_vals = dist_obj.pdf(x, *r["params"])
                 ax_hist.plot(x, pdf_vals, "r-", linewidth=2)
 
-            ax_hist.set_title(f"{r['name']}  (KS={r['ks_stat']:.4f}, p={r['p_value']:.4f})")
+            ax_hist.set_title(f"{r['name']}  (AD={r.get('ad_stat', np.nan):.4f}, p={r['p_value']:.4f})")
             ax_hist.grid(True, alpha=0.3)
 
             try:
@@ -1492,6 +1702,7 @@ class StatisticalApp(QMainWindow):
         self.cap_result_text.setReadOnly(True)
         self.cap_result_text.setFont(QFont("Courier", 10))
         result_layout.addWidget(self.cap_result_text)
+        self._add_copy_button(result_layout, self.cap_result_text)
         left_layout.addWidget(result_group)
 
     def _capability_distribution_spec(self, distribution):
@@ -2012,7 +2223,7 @@ class StatisticalApp(QMainWindow):
         ax3 = self.cap_canvas.fig.add_subplot(gs[1, 0])
         ax4 = self.cap_canvas.fig.add_subplot(gs[1, 1])
 
-        # === 1) Distribution — reprise du style MiniQual ===
+        # === 1) Distribution — style histogramme de capabilité ===
         dist_map = {
             "Normal": ("norm", scipy_stats.norm, "normale", lambda d: scipy_stats.norm.fit(d)),
             "Log-Normale": ("lognorm", scipy_stats.lognorm, "lognormale", lambda d: scipy_stats.lognorm.fit(d[d > 0], floc=0)),
@@ -2222,6 +2433,7 @@ class StatisticalApp(QMainWindow):
         self.norm_result_text.setReadOnly(True)
         self.norm_result_text.setFont(QFont("Courier", 10))
         result_layout.addWidget(self.norm_result_text)
+        self._add_copy_button(result_layout, self.norm_result_text)
         left_layout.addWidget(result_group)
 
     def _run_normality(self):
@@ -2370,6 +2582,7 @@ class StatisticalApp(QMainWindow):
         self.out_result_text.setReadOnly(True)
         self.out_result_text.setFont(QFont("Courier", 10))
         result_layout.addWidget(self.out_result_text)
+        self._add_copy_button(result_layout, self.out_result_text)
         left_layout.addWidget(result_group)
 
     def _run_outliers(self):
@@ -2472,48 +2685,111 @@ class StatisticalApp(QMainWindow):
         widget.setToolTip(text)
 
     def _copy_text(self, widget):
-        QApplication.clipboard().setText(widget.toPlainText())
+        try:
+            plain = self._clean_report_text(widget.toPlainText() if widget is not None else "")
+            mime = QMimeData()
+            mime.setText(plain)
+            safe = html.escape(plain)
+            rich = (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+                "<pre style=\"font-family:'Courier New', Consolas, monospace; font-size:10pt; line-height:1.15; white-space:pre; margin:0;\">"
+                f"{safe}</pre></body></html>"
+            )
+            mime.setHtml(rich)
+            QApplication.clipboard().setMimeData(mime)
+        except Exception:
+            QApplication.clipboard().setText(self._clean_report_text(widget.toPlainText() if widget is not None else ""))
+
 
     def _add_copy_button(self, layout, text_widget):
         btn = QPushButton(" Copier")
         btn.clicked.connect(lambda: self._copy_text(text_widget))
         layout.addWidget(btn)
 
+    def _clean_report_text(self, text):
+        if text is None:
+            return ""
+        cleaned = str(text)
+        pattern = re.compile(r"np\.(?:float16|float32|float64|float_|int8|int16|int32|int64|uint8|uint16|uint32|uint64)\(([^()]+)\)")
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = pattern.sub(lambda m: m.group(1), cleaned)
+        return cleaned.replace("nan", "NaN")
+
+    def _clean_report_sections(self, sections):
+        return [(title, self._clean_report_text(content)) for title, content in (sections or [])]
+
+    def _column_display_name(self, col_idx):
+        if hasattr(self, "sheet") and hasattr(self.sheet, "get_column_label"):
+            name = self.sheet.get_column_label(col_idx)
+        else:
+            name = col_letter(col_idx)
+        return str(name).strip() or col_letter(col_idx)
+
+    def _column_display_items(self, only_with_data=True):
+        items, used = [], {}
+        if not hasattr(self, "sheet"):
+            return items
+        for i in range(self.sheet.columnCount()):
+            data = self.sheet.get_column_data(i)
+            if only_with_data and (data is None or len(data) == 0):
+                continue
+            base = self._column_display_name(i)
+            display = base if base not in used else f"{base} ({col_letter(i)})"
+            used[base] = used.get(base, 0) + 1
+            items.append((display, i))
+        return items
+
+    def _column_index_from_label(self, label):
+        if label is None or not hasattr(self, "sheet"):
+            return None
+        text = str(label).strip()
+        if not text or text == "(aucune donnée)":
+            return None
+        m = re.search(r"\(([A-Z]+)\)$", text)
+        if m:
+            text = m.group(1)
+        for i in range(self.sheet.columnCount()):
+            if self._column_display_name(i) == text or col_letter(i) == text:
+                return i
+        if text.isalpha():
+            idx = 0
+            for char in text:
+                idx = idx * 26 + (ord(char.upper()) - ord("A") + 1)
+            return idx - 1
+        return None
+
+    def _populate_column_combo(self, combo, items, fallback_current_text=None):
+        current_idx = combo.currentData()
+        if not isinstance(current_idx, int):
+            current_idx = self._column_index_from_label(fallback_current_text or combo.currentText())
+        combo.clear()
+        if not items:
+            combo.addItem("(aucune donnée)", None)
+            return
+        for label, idx in items:
+            combo.addItem(label, idx)
+        if isinstance(current_idx, int):
+            for row in range(combo.count()):
+                if combo.itemData(row) == current_idx:
+                    combo.setCurrentIndex(row)
+                    break
+
     def _refresh_combos(self, *combos):
-        cols = [col_letter(i) for i in range(NUM_COLS)]
-        has_data = False
-        for i in range(NUM_COLS):
-            if self.sheet.get_column_data(i) is not None:
-                has_data = True
-                break
-        if not has_data:
-            cols = ["(aucune donnée)"]
+        items = self._column_display_items(only_with_data=True)
         for combo in combos:
-            current = combo.currentText()
-            combo.clear()
-            combo.addItems(cols)
-            if current in cols:
-                combo.setCurrentText(current)
+            self._populate_column_combo(combo, items)
+
 
     def _get_combo_data(self, combo):
-        letter = combo.currentText()
-        if not letter or letter == "(aucune donnée)":
+        idx = combo.currentData()
+        if not isinstance(idx, int):
+            idx = self._column_index_from_label(combo.currentText())
+        if idx is None or idx < 0 or idx >= self.sheet.columnCount():
             return None, None
+        return self.sheet.get_column_data(idx), self._column_display_name(idx)
 
-        try:
-            idx = 0
-            for char in letter:
-                if not char.isalpha():
-                    return None, None
-                idx = idx * 26 + (ord(char.upper()) - ord("A") + 1)
-            idx -= 1
-
-            if idx < 0 or idx >= self.sheet.columnCount():
-                return None, None
-
-            return self.sheet.get_column_data(idx), letter
-        except Exception:
-            return None, None
 
     def _get_all_numeric_columns(self):
         cols = {}
@@ -2576,13 +2852,12 @@ class StatisticalApp(QMainWindow):
         left_layout.addWidget(result_group)
 
     def _update_correlation_combos(self):
-        current_selections = []
-        if hasattr(self, "corr_col_combos") and self.corr_col_combos:
-            current_selections = [combo.currentText() for combo in self.corr_col_combos]
+        current = [c.currentText() for c in getattr(self, "corr_col_combos", [])]
         if not hasattr(self, "corr_combo_layout"):
             return
-        while self.corr_combo_layout.count():
-            item = self.corr_combo_layout.takeAt(0)
+        layout = self.corr_combo_layout
+        while layout.count():
+            item = layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
             elif item.layout():
@@ -2591,31 +2866,19 @@ class StatisticalApp(QMainWindow):
                     if child.widget():
                         child.widget().deleteLater()
         self.corr_col_combos = []
-        cols = []
-        if hasattr(self, "sheet"):
-            for i in range(self.sheet.columnCount()):
-                data = self.sheet.get_column_data(i)
-                if data is not None and len(data) > 0:
-                    cols.append(col_letter(i))
-        if not cols:
-            cols = ["(aucune donnée)"]
+        items = self._column_display_items(only_with_data=True)
         n = self.corr_ngroups.value() if hasattr(self, "corr_ngroups") else 2
         for i in range(n):
             row = QHBoxLayout()
-            label = QLabel(f"Colonne {i + 1} :")
-            label.setMinimumWidth(80)
-            row.addWidget(label)
+            row.addWidget(QLabel(f"Colonne {i + 1} :"))
             combo = QComboBox()
             combo.setMinimumWidth(100)
-            combo.addItems(cols)
-            if i < len(current_selections) and current_selections[i] in cols:
-                combo.setCurrentText(current_selections[i])
-            elif i < len(cols) and cols[0] != "(aucune donnée)":
-                combo.setCurrentText(cols[i % len(cols)])
+            self._populate_column_combo(combo, items, current[i] if i < len(current) else None)
             row.addWidget(combo)
             row.addStretch()
-            self.corr_combo_layout.addLayout(row)
+            layout.addLayout(row)
             self.corr_col_combos.append(combo)
+
 
     def _run_correlation(self):
         if not hasattr(self, "corr_col_combos") or not self.corr_col_combos:
@@ -2926,11 +3189,12 @@ class StatisticalApp(QMainWindow):
         left_layout.addWidget(result_group)
 
     def _update_anova_combos(self):
-        current_selections = [c.currentText() for c in getattr(self, "anova_col_combos", [])]
+        current = [c.currentText() for c in getattr(self, "anova_col_combos", [])]
         if not hasattr(self, "anova_combo_layout"):
             return
-        while self.anova_combo_layout.count():
-            item = self.anova_combo_layout.takeAt(0)
+        layout = self.anova_combo_layout
+        while layout.count():
+            item = layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
             elif item.layout():
@@ -2939,31 +3203,19 @@ class StatisticalApp(QMainWindow):
                     if child.widget():
                         child.widget().deleteLater()
         self.anova_col_combos = []
-        cols = []
-        if hasattr(self, "sheet"):
-            for i in range(self.sheet.columnCount()):
-                data = self.sheet.get_column_data(i)
-                if data is not None and len(data) > 0:
-                    cols.append(col_letter(i))
-        if not cols:
-            cols = ["(aucune donnée)"]
+        items = self._column_display_items(only_with_data=True)
         n = self.anova_ngroups.value() if hasattr(self, "anova_ngroups") else 2
         for i in range(n):
             row = QHBoxLayout()
-            label = QLabel(f"Groupe {i + 1} :")
-            label.setMinimumWidth(80)
-            row.addWidget(label)
+            row.addWidget(QLabel(f"Groupe {i + 1} :"))
             combo = QComboBox()
             combo.setMinimumWidth(100)
-            combo.addItems(cols)
-            if i < len(current_selections) and current_selections[i] in cols:
-                combo.setCurrentText(current_selections[i])
-            elif i < len(cols) and cols[0] != "(aucune donnée)":
-                combo.setCurrentText(cols[i % len(cols)])
+            self._populate_column_combo(combo, items, current[i] if i < len(current) else None)
             row.addWidget(combo)
             row.addStretch()
-            self.anova_combo_layout.addLayout(row)
+            layout.addLayout(row)
             self.anova_col_combos.append(combo)
+
 
     def _run_anova(self):
         group_data, group_labels, selected_letters = [], [], []
@@ -3310,11 +3562,12 @@ class StatisticalApp(QMainWindow):
         left_layout.addWidget(result_group)
 
     def _update_boxplot_combos(self):
-        current_selections = [c.currentText() for c in getattr(self, "boxplot_col_combos", [])]
+        current = [c.currentText() for c in getattr(self, "boxplot_col_combos", [])]
         if not hasattr(self, "boxplot_combo_layout"):
             return
-        while self.boxplot_combo_layout.count():
-            item = self.boxplot_combo_layout.takeAt(0)
+        layout = self.boxplot_combo_layout
+        while layout.count():
+            item = layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
             elif item.layout():
@@ -3323,31 +3576,19 @@ class StatisticalApp(QMainWindow):
                     if child.widget():
                         child.widget().deleteLater()
         self.boxplot_col_combos = []
-        cols = []
-        if hasattr(self, "sheet"):
-            for i in range(self.sheet.columnCount()):
-                data = self.sheet.get_column_data(i)
-                if data is not None and len(data) > 0:
-                    cols.append(col_letter(i))
-        if not cols:
-            cols = ["(aucune donnée)"]
+        items = self._column_display_items(only_with_data=True)
         n = self.boxplot_ngroups.value() if hasattr(self, "boxplot_ngroups") else 1
         for i in range(n):
             row = QHBoxLayout()
-            label = QLabel(f"Colonne {i + 1} :")
-            label.setMinimumWidth(80)
-            row.addWidget(label)
+            row.addWidget(QLabel(f"Colonne {i + 1} :"))
             combo = QComboBox()
             combo.setMinimumWidth(100)
-            combo.addItems(cols)
-            if i < len(current_selections) and current_selections[i] in cols:
-                combo.setCurrentText(current_selections[i])
-            elif i < len(cols) and cols[0] != "(aucune donnée)":
-                combo.setCurrentText(cols[i % len(cols)])
+            self._populate_column_combo(combo, items, current[i] if i < len(current) else None)
             row.addWidget(combo)
             row.addStretch()
-            self.boxplot_combo_layout.addLayout(row)
+            layout.addLayout(row)
             self.boxplot_col_combos.append(combo)
+
 
     def _run_boxplot(self):
         groups, selected_letters = {}, []
@@ -4724,6 +4965,7 @@ class StatisticalApp(QMainWindow):
         if not texts:
             QMessageBox.warning(self, "Attention", "Aucun résultat à exporter")
             return
+        texts = [(title, self._clean_report_text(content)) for title, content in texts]
 
         file_filters = (
             "Text (*.txt);;"
@@ -4747,7 +4989,7 @@ class StatisticalApp(QMainWindow):
                         f.write(f"{title}\n{content}\n\n")
 
             elif ext == '.pdf':
-                exporter = ReportExporter("Rapport StatPro", filepath)
+                exporter = ReportExporter("Rapport StatPro")
                 exporter.add_section("RÉSULTATS D'ANALYSE STATISTIQUE",
                                      f"Date : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
                 for title, content in texts:
@@ -4795,346 +5037,6 @@ class StatisticalApp(QMainWindow):
         except Exception as e:
             self._show_exception("Erreur", e, "Impossible d'exporter :")
 
-
-    # ===== MINIQUAL INTÉGRÉ À STATPRO =====
-    def _create_miniqual_tab(self):
-        tab = QWidget(); self.tabs.addTab(tab, "MiniQual")
-        layout = QHBoxLayout(tab); layout.setContentsMargins(5,5,5,5)
-        splitter = QSplitter(Qt.Horizontal); splitter.setChildrenCollapsible(False); layout.addWidget(splitter)
-        left = QWidget(); left.setMinimumWidth(380); left.setMaximumWidth(540)
-        left_layout = QVBoxLayout(left); left_layout.setContentsMargins(0,0,0,0)
-        params_group = QGroupBox("Capabilité MiniQual"); params = QFormLayout(params_group)
-        self.miniqual_col_combo = QComboBox(); params.addRow("Colonne mesure", self.miniqual_col_combo)
-        self.miniqual_distribution = QComboBox(); self.miniqual_distribution.addItems(["Normal","Log-Normale","Weibull (2P)","Exponentielle","Gamma","Logistique","Gumbel (max)","Cauchy","Rayleigh","Uniforme","Student-t","Laplace"]); params.addRow("Loi statistique", self.miniqual_distribution)
-        self.miniqual_lsl=QDoubleSpinBox(); self.miniqual_lsl.setRange(-1e9,1e9); self.miniqual_lsl.setSpecialValueText("Aucune"); self.miniqual_lsl.setValue(self.miniqual_lsl.minimum()); params.addRow("LSL", self.miniqual_lsl)
-        self.miniqual_usl=QDoubleSpinBox(); self.miniqual_usl.setRange(-1e9,1e9); self.miniqual_usl.setSpecialValueText("Aucune"); self.miniqual_usl.setValue(self.miniqual_usl.minimum()); params.addRow("USL", self.miniqual_usl)
-        self.miniqual_target=QDoubleSpinBox(); self.miniqual_target.setRange(-1e9,1e9); self.miniqual_target.setSpecialValueText("Aucune"); self.miniqual_target.setValue(self.miniqual_target.minimum()); params.addRow("Cible", self.miniqual_target)
-        self.miniqual_chi2_mode=QComboBox(); self.miniqual_chi2_mode.addItems(["auto","nombre"]); params.addRow("Mode Khi²", self.miniqual_chi2_mode)
-        self.miniqual_chi2_bins=QSpinBox(); self.miniqual_chi2_bins.setRange(4,50); self.miniqual_chi2_bins.setValue(10); params.addRow("Nombre de classes Khi²", self.miniqual_chi2_bins)
-        self.miniqual_cpk_accept=QDoubleSpinBox(); self.miniqual_cpk_accept.setRange(.1,10); self.miniqual_cpk_accept.setValue(1.33); self.miniqual_cpk_accept.setSingleStep(.01); params.addRow("Seuil Cpk accept.", self.miniqual_cpk_accept)
-        self.miniqual_cpk_excellent=QDoubleSpinBox(); self.miniqual_cpk_excellent.setRange(.1,10); self.miniqual_cpk_excellent.setValue(1.67); self.miniqual_cpk_excellent.setSingleStep(.01); params.addRow("Seuil Cpk excellent", self.miniqual_cpk_excellent)
-        self.miniqual_boxcox=QCheckBox("Activer transformation Box-Cox"); params.addRow(self.miniqual_boxcox)
-        self.miniqual_exclude_outliers=QCheckBox("Exclure valeurs aberrantes et recalculer"); params.addRow(self.miniqual_exclude_outliers)
-        left_layout.addWidget(params_group)
-        for label, cb in [("Calculer/afficher p-values lois", self._miniqual_show_pvalues), ("Générer rapport DOCX MiniQual", self._miniqual_generate_docx)]:
-            b=QPushButton(label); b.clicked.connect(cb); left_layout.addWidget(b)
-        sess=QGroupBox("Session / Résultats"); sl=QVBoxLayout(sess); self.miniqual_text=QTextEdit(); self.miniqual_text.setReadOnly(True); self.miniqual_text.setFont(QFont("Courier",10)); sl.addWidget(self.miniqual_text); left_layout.addWidget(sess,1)
-        right=QWidget(); rl=QVBoxLayout(right); rl.setContentsMargins(0,0,0,0); self.miniqual_canvas=MplCanvas(right,width=7,height=8); rl.addWidget(self.miniqual_canvas); tb=SafeNavigationToolbar(self.miniqual_canvas,right); tb.setObjectName("plotToolbar"); rl.addWidget(tb)
-        splitter.addWidget(left); splitter.addWidget(right); splitter.setSizes([430,900]); self.miniqual_last_out=None; self._refresh_all_combos()
-
-    def _miniqual_log(self,msg=""):
-        if hasattr(self,"miniqual_text"): self.miniqual_text.append(str(msg))
-
-    def _miniqual_params(self):
-        col=self.miniqual_col_combo.currentText()
-        if not col or col=="(aucune donnée)": raise ValueError("Sélectionnez une colonne mesure contenant des données.")
-        df=self._sheet_to_dataframe()
-        return dict(df=df,column=col,lsl=(None if self.miniqual_lsl.value()==self.miniqual_lsl.minimum() else self.miniqual_lsl.value()),usl=(None if self.miniqual_usl.value()==self.miniqual_usl.minimum() else self.miniqual_usl.value()),target=(None if self.miniqual_target.value()==self.miniqual_target.minimum() else self.miniqual_target.value()),distribution=self.miniqual_distribution.currentText(),chi2_bins=("auto" if self.miniqual_chi2_mode.currentText()=="auto" else self.miniqual_chi2_bins.value()),boxcox=self.miniqual_boxcox.isChecked(),exclude=self.miniqual_exclude_outliers.isChecked(),cpk_accept=self.miniqual_cpk_accept.value(),cpk_excellent=self.miniqual_cpk_excellent.value())
-
-    def _miniqual_dist(self,name):
-        return {"Normal":("normal","normale",scipy_stats.norm,"norm"),"Log-Normale":("lognormal","lognormale",scipy_stats.lognorm,"lognorm"),"Weibull (2P)":("weibull","Weibull",scipy_stats.weibull_min,"weibull_min"),"Exponentielle":("exponential","exponentielle",scipy_stats.expon,"expon"),"Gamma":("gamma","gamma",scipy_stats.gamma,"gamma"),"Logistique":("logistic","logistique",scipy_stats.logistic,"logistic"),"Gumbel (max)":("gumbel","Gumbel",scipy_stats.gumbel_r,"gumbel_r"),"Cauchy":("cauchy","Cauchy",scipy_stats.cauchy,"cauchy"),"Rayleigh":("rayleigh","Rayleigh",scipy_stats.rayleigh,"rayleigh"),"Uniforme":("uniform","uniforme",scipy_stats.uniform,"uniform"),"Student-t":("student_t","Student-t",scipy_stats.t,"t"),"Laplace":("laplace","Laplace",scipy_stats.laplace,"laplace")}.get(name,("normal","normale",scipy_stats.norm,"norm"))
-
-    def _miniqual_filter(self, x, key):
-        x = np.asarray(x, dtype=float)
-        x = x[np.isfinite(x)]
-        # Lois à support strictement positif lorsque loc est forcé à 0.
-        if key in ("lognormal", "weibull", "gamma", "rayleigh"):
-            return x[x > 0]
-        # Exponentielle 2P : loc libre, donc pas de filtre >=0.
-        return x
-
-    def _miniqual_fit(self, s, name):
-        key, label, obj, scipy_name = self._miniqual_dist(name)
-        x = pd.Series(s).dropna().astype(float).to_numpy()
-        xp = self._miniqual_filter(x, key)
-        if len(xp) < 3:
-            return dict(loi=key, p_value=np.nan, statistique=np.nan,
-                        paramètres="Données incompatibles", params=None, label=label, obj=obj)
-        try:
-            if key == "normal":
-                params = scipy_stats.norm.fit(xp)
-            elif key in ("lognormal", "weibull", "gamma", "rayleigh"):
-                params = obj.fit(xp, floc=0)
-            else:
-                # Exponentielle 2P, logistique, Gumbel, Cauchy, uniforme, Student-t, Laplace : loc libre.
-                params = obj.fit(xp)
-            st, pv = scipy_stats.kstest(xp, scipy_name, args=params)
-            return dict(loi=key, p_value=float(pv), statistique=float(st),
-                        paramètres=str(tuple(round(float(v), 6) for v in params)),
-                        params=params, label=label, obj=obj)
-        except Exception as e:
-            return dict(loi=key, p_value=np.nan, statistique=np.nan,
-                        paramètres=f"Erreur : {e}", params=None, label=label, obj=obj)
-
-    def _miniqual_pvalues_rows(self, s):
-        names = ["Normal", "Log-Normale", "Weibull (2P)", "Exponentielle", "Gamma",
-                 "Logistique", "Gumbel (max)", "Cauchy", "Rayleigh", "Uniforme",
-                 "Student-t", "Laplace"]
-        rows = [{k: v for k, v in self._miniqual_fit(s, n).items()
-                 if k not in ("params", "label", "obj")} for n in names]
-        return sorted(rows, key=lambda r: -r["p_value"] if pd.notna(r["p_value"]) else 1e9)
-
-    def _miniqual_nonnormal_capability(self, s, lsl=None, usl=None, distribution="Normal"):
-        """Capabilité MiniQual non normale par percentiles de la loi ajustée + ppm prédits."""
-        x = pd.Series(s).dropna().astype(float).to_numpy()
-        fit = self._miniqual_fit(x, distribution)
-        params = fit.get("params")
-        if params is None:
-            raise ValueError(f"Impossible d'ajuster la loi {distribution} : {fit.get('paramètres')}")
-        obj = fit["obj"]
-        p00135 = float(obj.ppf(0.00135, *params))
-        p50 = float(obj.ppf(0.50, *params))
-        p99865 = float(obj.ppf(0.99865, *params))
-        if not all(np.isfinite(v) for v in (p00135, p50, p99865)):
-            raise ValueError(f"Percentiles non calculables pour la loi {distribution}")
-        if not (p00135 < p50 < p99865):
-            raise ValueError(
-                f"Percentiles incohérents pour {distribution}: "
-                f"P0.135={p00135:.6g}, P50={p50:.6g}, P99.865={p99865:.6g}"
-            )
-
-        def safe_ratio(num, den):
-            num = float(num); den = float(den)
-            if not np.isfinite(num) or not np.isfinite(den) or abs(den) <= np.finfo(float).eps:
-                return None
-            return num / den
-
-        pp = safe_ratio(usl - lsl, p99865 - p00135) if (lsl is not None and usl is not None) else None
-        ppl = safe_ratio(p50 - lsl, p50 - p00135) if lsl is not None else None
-        ppu = safe_ratio(usl - p50, p99865 - p50) if usl is not None else None
-        vals = [v for v in (ppl, ppu) if v is not None and np.isfinite(v)]
-        ppk = min(vals) if vals else None
-
-        p_below = None
-        p_above = None
-        if lsl is not None:
-            p_below = max(0.0, min(1.0, float(obj.cdf(lsl, *params))))
-        if usl is not None:
-            cdf_usl = max(0.0, min(1.0, float(obj.cdf(usl, *params))))
-            p_above = max(0.0, 1.0 - cdf_usl)
-        ppm_below = p_below * 1_000_000 if p_below is not None else None
-        ppm_above = p_above * 1_000_000 if p_above is not None else None
-        ppm_total = (ppm_below or 0.0) + (ppm_above or 0.0)
-        prob_total = ppm_total / 1_000_000
-
-        return {
-            "Méthode capabilité": f"Non normale — percentiles de loi ajustée ({fit['label']})",
-            "loi ajustée": fit["label"],
-            "params loi ajustée": fit.get("paramètres"),
-            "p_value loi ajustée": fit.get("p_value"),
-            "q0_135": p00135,
-            "mediane": p50,
-            "q99_865": p99865,
-            "pp_non_normal": pp,
-            "ppl_non_normal": ppl,
-            "ppu_non_normal": ppu,
-            "ppk_non_normal": ppk,
-            "prob_below_lsl": p_below,
-            "prob_above_usl": p_above,
-            "prob_total_oos": prob_total,
-            "ppm_below_lsl": ppm_below,
-            "ppm_above_usl": ppm_above,
-            "ppm_total_oos": ppm_total,
-        }
-
-    def _miniqual_compute(self):
-        p = self._miniqual_params()
-        s = numeric_series(p["df"], p["column"])
-        validation = validate_capability(p["df"], p["column"], p["lsl"], p["usl"], p["target"], None, "normal")
-        analysis_s = s
-        lsl = p["lsl"]
-        usl = p["usl"]
-        target = p["target"]
-        info = {}
-
-        if p["exclude"]:
-            outs = outlier_tests(s)
-            vals = set(outs.get("values_to_exclude", []))
-            if vals:
-                before = len(analysis_s)
-                analysis_s = analysis_s[~analysis_s.astype(float).isin(vals)]
-                info["Valeurs aberrantes exclues"] = before - len(analysis_s)
-
-        if p["boxcox"]:
-            analysis_s, lsl, usl, target, bc = boxcox_transform(analysis_s, lsl, usl, target)
-            info.update(bc)
-
-        res = capability(analysis_s, lsl, usl, target)
-        res["loi choisie"] = p["distribution"]
-        res["Box-Cox activé"] = p["boxcox"]
-        res.update(info)
-
-        if p["distribution"] != "Normal":
-            nn = self._miniqual_nonnormal_capability(analysis_s, lsl, usl, p["distribution"])
-            res.update(nn)
-            res["pp_retenu"] = nn.get("pp_non_normal")
-            res["ppk_retenu"] = nn.get("ppk_non_normal")
-            res["ppl_retenu"] = nn.get("ppl_non_normal")
-            res["ppu_retenu"] = nn.get("ppu_non_normal")
-            res["capabilité retenue"] = "Non normale"
-        else:
-            res["Méthode capabilité"] = "Normale / classique"
-            res["pp_retenu"] = res.get("pp")
-            res["ppk_retenu"] = res.get("ppk")
-            res["ppl_retenu"] = res.get("ppk_lower")
-            res["ppu_retenu"] = res.get("ppk_upper")
-            res["capabilité retenue"] = "Normale / classique"
-            # Probabilités classiques déjà exprimées en ppm par capability().
-            ppm_below = res.get("ppm_below_lsl")
-            ppm_above = res.get("ppm_above_usl")
-            res["ppm_total_oos"] = (ppm_below or 0.0) + (ppm_above or 0.0)
-            res["prob_below_lsl"] = ppm_below / 1_000_000 if ppm_below is not None else None
-            res["prob_above_usl"] = ppm_above / 1_000_000 if ppm_above is not None else None
-            res["prob_total_oos"] = res["ppm_total_oos"] / 1_000_000
-
-        return p, s, analysis_s, res, validation
-
-    def _miniqual_dashboard(self, s, res, out_png=None):
-        p = self._miniqual_params()
-        data = pd.Series(s).dropna().astype(float).to_numpy()
-        fig = self.miniqual_canvas.fig
-        fig.clear()
-        fig.set_size_inches(15, 12)
-        ax = fig.subplots(2, 2)
-        fig.suptitle("Analyse de capabilité du procédé", fontsize=18, fontweight="bold")
-
-        m = float(np.mean(data))
-        sd = float(np.std(data, ddof=1)) if len(data) > 1 else 0.0
-
-        # 1) Histogramme + loi choisie
-        a = ax[0, 0]
-        a.hist(data, bins=min(15, max(5, int(np.sqrt(len(data))))), density=True, alpha=.75, edgecolor="black")
-        xs = [float(data.min()), float(data.max())]
-        if sd > 0:
-            xs += [m - 4 * sd, m + 4 * sd]
-        xs += [v for v in [res.get("lsl"), res.get("usl"), res.get("target")] if v is not None]
-        if res.get("q0_135") is not None:
-            xs += [res.get("q0_135"), res.get("q99_865")]
-        xx = np.linspace(min(xs), max(xs), 400)
-        fit = self._miniqual_fit(data, p["distribution"])
-        if fit.get("params") is not None:
-            try:
-                yy = fit["obj"].pdf(xx, *fit["params"])
-                if np.all(np.isfinite(yy)):
-                    a.plot(xx, yy, "r-", label=f"Courbe {fit['label']} estimée")
-            except Exception:
-                pass
-        for key, c, lab, ls in [("lsl", "green", "LSL", "--"), ("usl", "red", "USL", "--"), ("target", "purple", "Cible", ":")]:
-            if res.get(key) is not None:
-                a.axvline(res[key], color=c, ls=ls, label=f"{lab}={res[key]:.3g}")
-        a.axvline(m, color="orange", label=f"Moyenne={m:.3g}")
-        if res.get("q0_135") is not None:
-            a.axvline(res["q0_135"], color="gray", ls=":", linewidth=1, label="P0.135%")
-            a.axvline(res["q99_865"], color="gray", ls=":", linewidth=1, label="P99.865%")
-        a.legend(fontsize=8)
-        a.set_title(f"Distribution — {p['distribution']}")
-        a.grid(True, alpha=.25)
-
-        # 2) Boxplot
-        ax[0, 1].boxplot(data)
-        ax[0, 1].set_title("Boxplot")
-        ax[0, 1].grid(True, axis="y", alpha=.25)
-
-        # 3) Q-Q plot de la loi choisie
-        ax[1, 0].set_title(f"Q-Q plot — {p['distribution']}")
-        key = fit.get("loi")
-        xp = self._miniqual_filter(data, key)
-        if fit.get("params") is not None and len(xp) >= 3:
-            try:
-                probs = (np.arange(1, len(xp) + 1) - .5) / len(xp)
-                q = fit["obj"].ppf(probs, *fit["params"])
-                ordered = np.sort(xp)
-                ax[1, 0].scatter(q, ordered, s=12)
-                lo = min(q.min(), ordered.min())
-                hi = max(q.max(), ordered.max())
-                ax[1, 0].plot([lo, hi], [lo, hi], "r-")
-            except Exception:
-                ax[1, 0].text(.5, .5, "Q-Q plot indisponible", ha="center", va="center")
-        else:
-            ax[1, 0].text(.5, .5, "Q-Q plot indisponible", ha="center", va="center")
-        ax[1, 0].grid(True, alpha=.25)
-
-        # 4) Indices retenus : normal si loi normale, percentiles si loi non normale.
-        if p["distribution"] != "Normal" and res.get("ppk_non_normal") is not None:
-            items = [("Pp", "pp_non_normal"), ("Ppl", "ppl_non_normal"), ("Ppu", "ppu_non_normal"), ("Ppk", "ppk_non_normal")]
-            title = f"Indices non normaux — {p['distribution']}"
-        else:
-            items = [("Pp", "pp"), ("Ppl", "ppk_lower"), ("Ppu", "ppk_upper"), ("Ppk", "ppk")]
-            title = "Indices normaux/classiques"
-        labels, vals = [], []
-        for lab, key in items:
-            v = res.get(key)
-            if v is not None and np.isfinite(v):
-                labels.append(lab)
-                vals.append(float(v))
-        if vals:
-            bars = ax[1, 1].bar(labels, vals)
-            ax[1, 1].axhline(p["cpk_accept"], color="orange", ls="--", label=f"Accept. {p['cpk_accept']:.2f}")
-            ax[1, 1].axhline(p["cpk_excellent"], color="green", ls="--", label=f"Excellent {p['cpk_excellent']:.2f}")
-            y_min = min(vals + [0])
-            y_max = max(vals + [p["cpk_accept"], p["cpk_excellent"], 1.0])
-            ax[1, 1].set_ylim(y_min * 1.2 if y_min < 0 else 0, y_max * 1.25 if y_max > 0 else 1)
-            for bar, val in zip(bars, vals):
-                ax[1, 1].text(bar.get_x() + bar.get_width() / 2, val, f"{val:.2f}",
-                              ha="center", va="bottom" if val >= 0 else "top", fontsize=9)
-            ax[1, 1].legend(fontsize=8)
-        else:
-            ax[1, 1].text(.5, .5, "Indices indisponibles", ha="center", va="center")
-        ax[1, 1].set_title(title)
-        ax[1, 1].grid(True, axis="y", alpha=.25)
-
-        fig.tight_layout(rect=[0, 0, 1, .96])
-        if out_png:
-            fig.savefig(out_png, dpi=180, bbox_inches="tight")
-        self.miniqual_canvas.draw()
-
-    def _miniqual_show_pvalues(self):
-        try:
-            p, s, analysis_s, res, validation = self._miniqual_compute()
-            self.miniqual_text.clear()
-
-            # Rapport type Minitab aussi dans MiniQual.
-            report = self._format_capability_minitab_report(
-                analysis_s,
-                res,
-                distribution=p["distribution"],
-                column_name=p["column"],
-                lsl=res.get("lsl"),
-                usl=res.get("usl"),
-                target=res.get("target"),
-                method_label="MiniQual",
-                accept_threshold=p.get("cpk_accept", 1.33),
-                excellent_threshold=p.get("cpk_excellent", 1.67)
-            )
-            self._miniqual_log(report)
-
-            self._miniqual_log("\n\n" + "=" * 60)
-            self._miniqual_log("P-VALUES PAR LOI STATISTIQUE")
-            self._miniqual_log("=" * 60)
-            for r in self._miniqual_pvalues_rows(s):
-                pv = r['p_value']
-                st = r['statistique']
-                self._miniqual_log(f"{r['loi']:<12} p={pv:.5g} stat={st:.5g}" if pd.notna(pv) else f"{r['loi']:<12} p=N/A stat=N/A")
-            self._miniqual_dashboard(analysis_s, res)
-        except Exception as e:
-            self._miniqual_log(f"ERREUR MiniQual : {e}")
-            QMessageBox.warning(self, "MiniQual", str(e))
-
-    def _miniqual_generate_docx(self):
-        out_dir=QFileDialog.getExistingDirectory(self,"Choisir le dossier de sortie MiniQual","")
-        if not out_dir: return
-        out=Path(out_dir); out.mkdir(parents=True,exist_ok=True)
-        try:
-            p,s,analysis_s,res,validation=self._miniqual_compute(); distrows=self._miniqual_pvalues_rows(s); outs=outlier_tests(s); norm=normality_tests(s); chi2=chi_square_gof(s,"normal",p["chi2_bins"])
-            nn={k:res.get(k) for k in ["Méthode capabilité","loi ajustée","params loi ajustée","p_value loi ajustée","q0_135","mediane","q99_865","pp_non_normal","ppl_non_normal","ppu_non_normal","ppk_non_normal","prob_below_lsl","prob_above_usl","prob_total_oos","ppm_below_lsl","ppm_above_usl","ppm_total_oos"] if k in res}
-            cap_report=self._format_capability_minitab_report(analysis_s,res,distribution=p["distribution"],column_name=p["column"],lsl=res.get("lsl"),usl=res.get("usl"),target=res.get("target"),method_label="MiniQual",accept_threshold=p.get("cpk_accept",1.33),excellent_threshold=p.get("cpk_excellent",1.67))
-            ppk_ret=res.get("ppk_retenu")
-            summary={"Statut global":"OK" if (ppk_ret or 0)>=p["cpk_accept"] and res.get("observed_nc_count",0)==0 else "À SURVEILLER / ACTION À ÉVALUER","Ppk retenu":ppk_ret,"Méthode capabilité":res.get("capabilité retenue"),"Statut validation fichier":status(validation),"Khi² p-value":chi2.get("p-value"),"Colonne mesure":p["column"],"Loi choisie":p["distribution"],"PPM total prédit":res.get("ppm_total_oos")}
-            png=out/"capability_dashboard.png"; self._miniqual_dashboard(analysis_s,res,png)
-            sections=[("Résumé décisionnel",summary),("Rapport de capabilité",cap_report),("Validation du fichier d’entrée",validation),("P-values par loi statistique",distrows),("Données et statistiques descriptives",descriptive(s)),("Tests de valeurs aberrantes",outs["table"]),("Tests de normalité",norm["table"]),("Test du Khi²",chi2),("Capabilité non normale / percentiles et ppm",nn),("Capabilité du procédé",res),("Visualisations",str(png))]
-            report_path=out/"capability_report.docx"; write_docx("Rapport de capabilité procédé",sections,report_path); self.miniqual_last_out=out; self._miniqual_log(f"Rapport DOCX MiniQual généré : {report_path}"); self.status_bar.showMessage(f"Rapport DOCX MiniQual généré : {report_path}"); QMessageBox.information(self,"MiniQual",f"Rapport DOCX généré :\n{report_path}")
-        except Exception as e:
-            import traceback; self._miniqual_log("=== ERREUR MINIQUAL ==="); self._miniqual_log(traceback.format_exc()); self._show_exception("MiniQual", e, "Impossible de générer le rapport DOCX")
 
 
     # ===== DOE / PLANS D'EXPÉRIENCES =====
@@ -5327,11 +5229,12 @@ class StatisticalApp(QMainWindow):
         # colonne réponse laissée vide ; place un rappel non numérique sur la première cellule si possible évité pour ne pas perturber combos.
 
     def _update_doe_factor_combos(self):
+        current = [c.currentText() for c in getattr(self, "doe_factor_col_combos", [])]
         if not hasattr(self, "doe_factor_combo_layout"):
             return
-        current = [c.currentText() for c in getattr(self, "doe_factor_col_combos", [])]
-        while self.doe_factor_combo_layout.count():
-            item = self.doe_factor_combo_layout.takeAt(0)
+        layout = self.doe_factor_combo_layout
+        while layout.count():
+            item = layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
             elif item.layout():
@@ -5339,27 +5242,20 @@ class StatisticalApp(QMainWindow):
                     child = item.layout().takeAt(0)
                     if child.widget():
                         child.widget().deleteLater()
-        cols = []
-        if hasattr(self, "sheet"):
-            for i in range(self.sheet.columnCount()):
-                data = self.sheet.get_column_data(i)
-                if data is not None and len(data) > 0:
-                    cols.append(col_letter(i))
-        if not cols:
-            cols = ["(aucune donnée)"]
         self.doe_factor_col_combos = []
+        items = self._column_display_items(only_with_data=True)
         n = self.doe_analyze_n_factors.value() if hasattr(self, "doe_analyze_n_factors") else 2
         for i in range(n):
             row = QHBoxLayout()
-            row.addWidget(QLabel(f"Facteur {i+1} :"))
-            combo = QComboBox(); combo.addItems(cols); combo.setMinimumWidth(90)
-            if i < len(current) and current[i] in cols:
-                combo.setCurrentText(current[i])
-            elif i < len(cols) and cols[0] != "(aucune donnée)":
-                combo.setCurrentText(cols[i % len(cols)])
-            row.addWidget(combo); row.addStretch()
-            self.doe_factor_combo_layout.addLayout(row)
+            row.addWidget(QLabel(f"Facteur {i + 1} :"))
+            combo = QComboBox()
+            combo.setMinimumWidth(100)
+            self._populate_column_combo(combo, items, current[i] if i < len(current) else None)
+            row.addWidget(combo)
+            row.addStretch()
+            layout.addLayout(row)
             self.doe_factor_col_combos.append(combo)
+
 
     def _run_doe_analysis(self):
         try:
@@ -5485,30 +5381,37 @@ class StatisticalApp(QMainWindow):
         refresh_btn.clicked.connect(self._refresh_report_panel)
         export_btn = QPushButton(" Exporter PDF/DOCX")
         export_btn.clicked.connect(self._export_full_report)
-        excel_btn = QPushButton(" Exporter Excel multi-feuilles")
-        excel_btn.clicked.connect(self._export_excel_workbook)
+        copy_btn = QPushButton(" Copier rapport")
+        copy_btn.clicked.connect(lambda: self._copy_text(self.report_text))
         btns.addWidget(refresh_btn)
         btns.addWidget(export_btn)
-        btns.addWidget(excel_btn)
+        btns.addWidget(copy_btn)
         btns.addStretch()
         layout.addLayout(btns)
 
     def _sheet_to_dataframe(self):
+        """Convertit la feuille en DataFrame avec la ligne 0 comme noms de colonnes et les données à partir de la ligne 1."""
         data = {}
         max_len = 0
+        used = {}
         for c in range(self.sheet.columnCount()):
+            base_name = self.sheet.get_column_label(c) if hasattr(self.sheet, "get_column_label") else col_letter(c)
+            base_name = str(base_name).strip() or col_letter(c)
+            name = base_name if base_name not in used else f"{base_name} ({col_letter(c)})"
+            used[base_name] = used.get(base_name, 0) + 1
             col_data = []
-            for r in range(self.sheet.rowCount()):
+            for r in range(1, self.sheet.rowCount()):
                 item = self.sheet.item(r, c)
                 col_data.append(item.text() if item and item.text() else "")
             while col_data and col_data[-1] == "":
                 col_data.pop()
             if col_data:
-                data[col_letter(c)] = col_data
+                data[name] = col_data
                 max_len = max(max_len, len(col_data))
         for k in data:
             data[k] += [""] * (max_len - len(data[k]))
         return pd.DataFrame(data)
+
 
     def _load_dataframe_strings(self, df):
         self.sheet.clearContents()
@@ -5528,7 +5431,7 @@ class StatisticalApp(QMainWindow):
         if QMessageBox.question(self, "Nouveau projet", "Effacer les données et résultats actuels ?") != QMessageBox.Yes:
             return
         self.sheet.clearContents()
-        for widget_name in ["stats_text", "cap_result_text", "norm_result_text", "out_result_text", "cc_result_text", "prob_result_text", "reg_result_text", "tt_result_text", "anova_result_text", "corr_result_text", "boxplot_result_text", "msa_result_text", "doe_result_text", "dist_result_text", "miniqual_text"]:
+        for widget_name in ["stats_text", "cap_result_text", "norm_result_text", "out_result_text", "cc_result_text", "prob_result_text", "reg_result_text", "tt_result_text", "anova_result_text", "corr_result_text", "boxplot_result_text", "msa_result_text", "doe_result_text", "dist_result_text"]:
             if hasattr(self, widget_name):
                 getattr(self, widget_name).clear()
         self.current_project_path = None
@@ -5571,7 +5474,7 @@ class StatisticalApp(QMainWindow):
         """Collecte les paramètres UI principaux pour les persister dans le projet."""
         params = {"widgets": {}, "combo_lists": {}}
         prefixes = (
-            "cap_", "miniqual_", "anova_", "doe_", "msa_", "cc_", "prob_",
+            "cap_", "anova_", "doe_", "msa_", "cc_", "prob_",
             "reg_", "tt_", "corr_", "boxplot_", "dist_", "norm_", "out_",
         )
         for attr in dir(self):
@@ -5882,6 +5785,117 @@ class StatisticalApp(QMainWindow):
         return sections
 
 
+    def _set_docx_run_monospace(self, run, size_pt=7.8, bold=False):
+        from docx.shared import Pt
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        run.font.name = "Courier New"
+        run.font.size = Pt(size_pt)
+        run.bold = bool(bold)
+        rPr = run._element.get_or_add_rPr()
+        rFonts = rPr.rFonts
+        if rFonts is None:
+            rFonts = OxmlElement('w:rFonts')
+            rPr.append(rFonts)
+        for key in ('w:ascii', 'w:hAnsi', 'w:eastAsia', 'w:cs'):
+            rFonts.set(qn(key), 'Courier New')
+        for node in run._r.xpath('.//w:t'):
+            node.set(qn('xml:space'), 'preserve')
+
+    def _export_report_pdf_fixed_text(self, filepath, sections, images):
+        from reportlab.pdfgen import canvas as pdf_canvas
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import cm
+        from reportlab.lib.utils import ImageReader
+        page_size = A4
+        c = pdf_canvas.Canvas(filepath, pagesize=page_size)
+        page_w, page_h = page_size
+        left = 0.75 * cm
+        top = page_h - 0.75 * cm
+        bottom = 0.75 * cm
+        line_h = 9.0
+        code_size = 7.3
+        def new_page():
+            c.showPage()
+            return top
+        y = top
+        c.setFont("Courier-Bold", 14)
+        c.drawString(left, y, "RAPPORT D'ANALYSE STATPRO")
+        y -= 17
+        c.setFont("Courier", 8.2)
+        c.drawString(left, y, f"Date : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
+        y -= 20
+        for title, content in sections:
+            if y < bottom + 35:
+                y = new_page()
+            c.setFont("Courier-Bold", 12)
+            c.drawString(left, y, title)
+            y -= 14
+            c.setFont("Courier", code_size)
+            for line in (content or "").splitlines():
+                if y < bottom:
+                    y = new_page()
+                    c.setFont("Courier", code_size)
+                c.drawString(left, y, line)
+                y -= line_h
+            if title in images:
+                try:
+                    img_reader = ImageReader(images[title])
+                    iw, ih = img_reader.getSize()
+                    desired_w = min(7.0 * 72.0, page_w - 2 * left)
+                    draw_w = desired_w
+                    draw_h = ih * (draw_w / iw)
+                    max_page_h = page_h - bottom - (0.75 * cm) - 1.0 * cm
+                    if draw_h > max_page_h:
+                        scale = max_page_h / draw_h
+                        draw_w *= scale
+                        draw_h *= scale
+                    available_h = y - bottom - 10
+                    if available_h < draw_h:
+                        y = new_page()
+                    y -= 8
+                    c.drawImage(img_reader, left, y - draw_h, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+                    y -= draw_h + 12
+                except Exception:
+                    pass
+            y -= 8
+        c.save()
+
+    def _export_report_docx_fixed_text(self, filepath, sections, images):
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Inches, Pt
+        doc = Document()
+        for section in doc.sections:
+            section.top_margin = Inches(0.45)
+            section.bottom_margin = Inches(0.45)
+            section.left_margin = Inches(0.45)
+            section.right_margin = Inches(0.45)
+        pre_style = doc.styles["StatProPre"] if "StatProPre" in [s.name for s in doc.styles] else doc.styles.add_style("StatProPre", 1)
+        pre_style.font.name = "Courier New"
+        pre_style.font.size = Pt(7.8)
+        pre_style.paragraph_format.space_before = Pt(0)
+        pre_style.paragraph_format.space_after = Pt(0)
+        pre_style.paragraph_format.line_spacing = 1.0
+        h = doc.add_paragraph(style="StatProPre")
+        h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        self._set_docx_run_monospace(h.add_run("RAPPORT D'ANALYSE STATPRO"), 14, bold=True)
+        p = doc.add_paragraph(style="StatProPre")
+        self._set_docx_run_monospace(p.add_run(f"Date : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}"), 8.2)
+        for title, content in sections:
+            doc.add_paragraph("")
+            hp = doc.add_paragraph(style="StatProPre")
+            hp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            self._set_docx_run_monospace(hp.add_run(title), 12, bold=True)
+            for line in (content or "").splitlines():
+                p = doc.add_paragraph(style="StatProPre")
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                self._set_docx_run_monospace(p.add_run(line if line else " "), 7.8)
+            if title in images:
+                doc.add_paragraph("Graphique associé :")
+                doc.add_picture(images[title], width=Inches(7.0))
+        doc.save(filepath)
+
     def _canvas_map(self):
         """Associe les titres de rapport aux graphiques disponibles."""
         return {
@@ -5910,9 +5924,9 @@ class StatisticalApp(QMainWindow):
     def _refresh_report_panel(self):
         if not hasattr(self, "report_text"):
             return
-        import html
-        sections = self._collect_report_sections()
+        sections = self._clean_report_sections(self._collect_report_sections())
         html_parts = [
+            "<html><head><meta charset='utf-8'><style>body{font-family:Arial, sans-serif;} pre{font-family:'Courier New', Consolas, monospace; font-size:10pt; line-height:1.15; white-space:pre; margin:0;} h1{font-size:18pt; font-weight:bold;} h2{font-size:13pt; font-weight:bold; margin-top:16px;}</style></head><body>",
             "<h1>RAPPORT D'ANALYSE STATPRO</h1>",
             f"<p><b>Date :</b> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>",
         ]
@@ -5923,6 +5937,7 @@ class StatisticalApp(QMainWindow):
         for title, content in sections:
             html_parts.append(f"<h2><b>{html.escape(title)}</b></h2>")
             html_parts.append(f"<pre>{html.escape(content)}</pre>")
+        html_parts.append("</body></html>")
         self.report_text.setHtml("\n".join(html_parts))
 
     def _export_full_report(self):
@@ -5932,52 +5947,22 @@ class StatisticalApp(QMainWindow):
             return
         try:
             ext = os.path.splitext(filepath)[1].lower()
-            sections = self._collect_report_sections()
+            if ext not in (".pdf", ".docx"):
+                ext = ".pdf"
+                filepath += ext
+            sections = self._clean_report_sections(self._collect_report_sections())
             tmpdir = tempfile.mkdtemp(prefix="statpro_report_")
             images = {}
             for title, canvas in self._canvas_map().items():
                 if canvas is not None and canvas.fig is not None and canvas.fig.axes:
-                    safe_title = title.replace("/", "_").replace(" ", "_").replace("&", "et")
+                    safe_title = re.sub(r"[^A-Za-z0-9_.-]+", "_", title).strip("_") or "graphique"
                     img = os.path.join(tmpdir, safe_title + ".png")
                     self._save_canvas_for_report(canvas, img, dpi=240)
                     images[title] = img
             if ext == ".docx":
-                from docx import Document
-                from docx.shared import Inches, Pt
-                doc = Document()
-                # Marges réduites pour laisser plus de largeur aux graphiques.
-                for section in doc.sections:
-                    section.top_margin = Inches(0.55)
-                    section.bottom_margin = Inches(0.55)
-                    section.left_margin = Inches(0.55)
-                    section.right_margin = Inches(0.55)
-                styles = doc.styles
-                styles["Normal"].font.size = Pt(10)
-                styles["Heading 1"].font.size = Pt(15)
-                doc.add_heading("Rapport d'analyse StatPro", 0)
-                doc.add_paragraph(f"Date : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
-                for title, content in sections:
-                    doc.add_heading(title, level=1)
-                    doc.add_paragraph(content)
-                    if title in images:
-                        doc.add_paragraph("Graphique associé :")
-                        # Largeur adaptée à une page A4/Letter avec marges réduites.
-                        doc.add_picture(images[title], width=Inches(7.1))
-                doc.save(filepath)
+                self._export_report_docx_fixed_text(filepath, sections, images)
             else:
-                from reportlab.lib.pagesizes import A4
-                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak
-                from reportlab.lib.styles import getSampleStyleSheet
-                styles = getSampleStyleSheet()
-                story = [Paragraph("Rapport d'analyse StatPro", styles["Title"]), Paragraph(f"Date : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]), Spacer(1, 12)]
-                for title, content in sections:
-                    story.append(Paragraph(title, styles["Heading1"]))
-                    story.append(Paragraph("<br/>".join(content.replace("&", "&amp;").replace("<", "&lt;").splitlines()), styles["Code"]))
-                    if title in images:
-                        story.append(Spacer(1, 8))
-                        story.append(Image(images[title], width=520, height=360, kind="proportional"))
-                    story.append(PageBreak())
-                SimpleDocTemplate(filepath, pagesize=A4).build(story)
+                self._export_report_pdf_fixed_text(filepath, sections, images)
             shutil.rmtree(tmpdir, ignore_errors=True)
             self.status_bar.showMessage(f"Rapport complet exporté : {filepath}")
         except Exception as e:
@@ -5985,21 +5970,8 @@ class StatisticalApp(QMainWindow):
 
 
     def _export_excel_workbook(self):
-        filepath, _ = QFileDialog.getSaveFileName(self, "Exporter Excel multi-feuilles", "statpro_resultats.xlsx", "Excel (*.xlsx)")
-        if not filepath:
-            return
-        if not filepath.lower().endswith(".xlsx"):
-            filepath += ".xlsx"
-        try:
-            with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-                self._sheet_to_dataframe().to_excel(writer, sheet_name="Données", index=False)
-                for title, content in self._collect_report_sections():
-                    safe = title[:31].replace("/", "-")
-                    pd.DataFrame({"Résultats": content.splitlines()}).to_excel(writer, sheet_name=safe, index=False)
-                pd.DataFrame({"Rapport": (self.report_text.toPlainText() if hasattr(self, "report_text") else "").splitlines()}).to_excel(writer, sheet_name="Rapport", index=False)
-            self.status_bar.showMessage(f"Excel multi-feuilles exporté : {filepath}")
-        except Exception as e:
-            self._show_exception("Erreur", e, "Impossible d'exporter Excel :")
+        QMessageBox.information(self, "Export Excel", "L'export Excel a été retiré.")
+
 
     def _show_about(self):
         QMessageBox.information(
